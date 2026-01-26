@@ -7,8 +7,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout project
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
@@ -20,20 +19,15 @@ jobs:
         run: |
           git clone --depth 1 -b v25.12.0-rc3 https://github.com/openwrt/openwrt.git openwrt
 
-      # --- БЛОК КЭШИРОВАНИЯ ---
       - name: Cache Toolchain & DL
         uses: actions/cache@v4
         with:
           path: |
             openwrt/dl
             openwrt/staging_dir
-            openwrt/build_dir/host
-          key: ${{ runner.os }}-openwrt-bpi-r4-${{ hashFiles('openwrt/feeds.conf.default') }}
-          restore-keys: |
-            ${{ runner.os }}-openwrt-bpi-r4-
-      # ------------------------
+          key: ${{ runner.os }}-openwrt-v1
 
-      - name: Update and Install Feeds
+      - name: Update Feeds (GitHub Mirrors)
         run: |
           cd openwrt
           sed -i 's|https://git.openwrt.org/feed/|https://github.com/openwrt/|g' feeds.conf.default
@@ -44,28 +38,28 @@ jobs:
       - name: Apply Custom Patches
         run: |
           mkdir -p openwrt/target/linux/mediatek/patches-6.12
-          [ -d patches ] && cp patches/*.patch openwrt/target/linux/mediatek/patches-6.12/
-          echo "Patches applied."
+          cp patches/*.patch openwrt/target/linux/mediatek/patches-6.12/ || true
+          
+          # Отладка: если патч упадет на следующем шаге, мы увидим файл в логах
+          echo "--- Content of DTS for debugging ---"
+          head -n 200 openwrt/target/linux/mediatek/files-6.12/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts || echo "File not in files-6.12"
 
-      - name: Generate Configuration
+      - name: Build Firmware
         run: |
           cd openwrt
+          # Настройка конфига
           echo "CONFIG_TARGET_mediatek=y" > .config
           echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
           echo "CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
           echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-acme=y" >> .config
-          echo "CONFIG_PACKAGE_nginx-ssl=y" >> .config
           make defconfig
-
-      - name: Build Firmware
-        run: |
-          cd openwrt
+          
+          # Сборка
           make -j$(nproc) || make -j1 V=s
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: BPi-R4-25.12-rc3-Custom
+          name: BPi-R4-Firmware
           path: openwrt/bin/targets/mediatek/filogic/*.itb
