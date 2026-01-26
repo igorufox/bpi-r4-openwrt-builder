@@ -28,7 +28,7 @@ jobs:
             openwrt/staging_dir
           key: ${{ runner.os }}-openwrt-v25-12
 
-      - name: Update Feeds (Fix 503 via Mirrors)
+      - name: Update Feeds
         run: |
           cd openwrt
           sed -i 's|https://git.openwrt.org/feed/|https://github.com/openwrt/|g' feeds.conf.default
@@ -36,12 +36,33 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Apply Custom Patches
+      - name: Hack Source (PWM6 & SFP ODI)
         run: |
-          # Копируем патчи в дерево ядра 6.12
-          mkdir -p openwrt/target/linux/mediatek/patches-6.12
-          [ -d patches ] && cp patches/*.patch openwrt/target/linux/mediatek/patches-6.12/
-          echo "Patches staged for build system."
+          cd openwrt
+          
+          # 1. Активируем Пин 7 (PWM6) для вентилятора
+          # Ищем DTS файл и дописываем настройки в конец (метод override)
+          DTS_FILE=$(find target/linux/mediatek -name "mt7988a-bananapi-bpi-r4.dts")
+          if [ -f "$DTS_FILE" ]; then
+            echo -e "\n&pio { pwm6_pins: pwm6-pins { mux { function = \"pwm\"; groups = \"pwm6\"; }; }; };" >> $DTS_FILE
+            echo -e "&pwm { pinctrl-0 = <&pwm0_pins>, <&pwm6_pins>; status = \"okay\"; };" >> $DTS_FILE
+            echo "DTS Patched: $DTS_FILE"
+          fi
+
+          # 2. Лечим SFP ODI 2.5G
+          # Поскольку исходники ядра еще не скачаны, мы создаем патч-инъекцию прямо в дерево таргета
+          # Это гарантирует, что OpenWrt сам применит это при сборке ядра
+          mkdir -p target/linux/mediatek/patches-6.12
+          cat << 'EOF' > target/linux/mediatek/patches-6.12/999-sfp-odi-quirk.patch
+--- a/drivers/net/phy/sfp-quirks.c
++++ b/drivers/net/phy/sfp-quirks.c
+@@ -401,6 +401,7 @@ static const struct sfp_quirk sfp_quirks[] = {
+ 	SFP_QUIRK_F("HUAWEI", "MA5671A", sfp_quirk_2500base_x),
+ 	SFP_QUIRK_F("ODI", "DFP-34X-2C2", sfp_quirk_2500base_x),
++	SFP_QUIRK_F("ODI", "DFP-34X-2C3", sfp_quirk_2500base_x),
+ 	SFP_QUIRK_M("SFP-GE-T", sfp_quirk_1000base_t),
+EOF
+          echo "SFP Quirk Staged."
 
       - name: Generate Configuration
         run: |
@@ -61,5 +82,5 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: BPi-R4-Firmware-Custom
+          name: BPi-R4-Custom-Firmware
           path: openwrt/bin/targets/mediatek/filogic/*.itb
