@@ -31,8 +31,10 @@ jobs:
       - name: Update Feeds
         run: |
           cd openwrt
+          # Переключаемся на зеркала и выкидываем битый фид video
           sed -i 's|https://git.openwrt.org/feed/|https://github.com/openwrt/|g' feeds.conf.default
           sed -i 's|https://git.openwrt.org/project/|https://github.com/openwrt/|g' feeds.conf.default
+          sed -i '/video/d' feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
@@ -41,16 +43,28 @@ jobs:
           cd openwrt
           
           # 1. Прямая правка DTS для вентилятора (PWM6)
+          # В 25.12-rc3 файл лежит в files-6.12
           DTS="target/linux/mediatek/files-6.12/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts"
           if [ -f "$DTS" ]; then
-            echo "Modifying DTS at $DTS"
+            echo "Modifying DTS for Fan PWM6..."
             echo -e "\n&pio {\n\tpwm6_pins: pwm6-pins {\n\t\tmux {\n\t\t\tfunction = \"pwm\";\n\t\t\tgroups = \"pwm6\";\n\t\t};\n\t};\n};\n\n&pwm {\n\tpinctrl-0 = <&pwm0_pins>, <&pwm6_pins>;\n\tstatus = \"okay\";\n};" >> "$DTS"
+          else
+            echo "ERROR: DTS file NOT FOUND at $DTS"
+            exit 1
           fi
 
-          # 2. Создание патча для SFP ODI (путь внутри ядра)
+          # 2. Создание патча для SFP ODI (с исправленным путем a/ и b/)
           mkdir -p target/linux/mediatek/patches-6.12
-          printf -- '---\n+++ b/drivers/net/phy/sfp-quirks.c\n@@ -401,6 +401,7 @@\n \tSFP_QUIRK_F("HUAWEI", "MA5671A", sfp_quirk_2500base_x),\n \tSFP_QUIRK_F("ODI", "DFP-34X-2C2", sfp_quirk_2500base_x),\n+\tSFP_QUIRK_F("ODI", "DFP-34X-2C3", sfp_quirk_2500base_x),\n \tSFP_QUIRK_M("SFP-GE-T", sfp_quirk_1000base_t),\n' > target/linux/mediatek/patches-6.12/999-sfp-odi-quirk.patch
-          echo "SFP Patch created at target/linux/mediatek/patches-6.12/999-sfp-odi-quirk.patch"
+          cat << 'EOF' > target/linux/mediatek/patches-6.12/999-sfp-odi-quirk.patch
+--- a/drivers/net/phy/sfp-quirks.c
++++ b/drivers/net/phy/sfp-quirks.c
+@@ -401,6 +401,7 @@ static const struct sfp_quirk sfp_quirks[] = {
+ 	SFP_QUIRK_F("HUAWEI", "MA5671A", sfp_quirk_2500base_x),
+ 	SFP_QUIRK_F("ODI", "DFP-34X-2C2", sfp_quirk_2500base_x),
++	SFP_QUIRK_F("ODI", "DFP-34X-2C3", sfp_quirk_2500base_x),
+ 	SFP_QUIRK_M("SFP-GE-T", sfp_quirk_1000base_t),
+ EOF
+          echo "SFP Patch created successfully."
 
       - name: Generate Configuration
         run: |
