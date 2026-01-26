@@ -7,7 +7,8 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout project
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
@@ -25,9 +26,9 @@ jobs:
           path: |
             openwrt/dl
             openwrt/staging_dir
-          key: ${{ runner.os }}-openwrt-v1
+          key: ${{ runner.os }}-openwrt-v25-12
 
-      - name: Update Feeds (GitHub Mirrors)
+      - name: Update Feeds (Fix 503 via Mirrors)
         run: |
           cd openwrt
           sed -i 's|https://git.openwrt.org/feed/|https://github.com/openwrt/|g' feeds.conf.default
@@ -37,29 +38,28 @@ jobs:
 
       - name: Apply Custom Patches
         run: |
+          # Копируем патчи в дерево ядра 6.12
           mkdir -p openwrt/target/linux/mediatek/patches-6.12
-          cp patches/*.patch openwrt/target/linux/mediatek/patches-6.12/ || true
-          
-          # Отладка: если патч упадет на следующем шаге, мы увидим файл в логах
-          echo "--- Content of DTS for debugging ---"
-          head -n 200 openwrt/target/linux/mediatek/files-6.12/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts || echo "File not in files-6.12"
+          [ -d patches ] && cp patches/*.patch openwrt/target/linux/mediatek/patches-6.12/
+          echo "Patches staged for build system."
 
-      - name: Build Firmware
+      - name: Generate Configuration
         run: |
           cd openwrt
-          # Настройка конфига
           echo "CONFIG_TARGET_mediatek=y" > .config
           echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
           echo "CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
           echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
           make defconfig
-          
-          # Сборка
+
+      - name: Build Firmware
+        run: |
+          cd openwrt
           make -j$(nproc) || make -j1 V=s
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: BPi-R4-Firmware
+          name: BPi-R4-Firmware-Custom
           path: openwrt/bin/targets/mediatek/filogic/*.itb
