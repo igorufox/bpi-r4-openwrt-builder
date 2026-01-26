@@ -1,0 +1,24 @@
+--- a/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtsi
+@@ -116,6 +116,13 @@
+ 		};
+ 	};
+ 
++	pwm6_pins: pwm6-pins {
++		mux {
++			function = "pwm";
++			groups = "pwm6_0";
++		};
++	};
++
+ 	spi0_pins: spi0-pins {
+ 		mux {
+ 			function = "spi";
+@@ -156,7 +163,7 @@
+ 
+ &pwm {
+ 	pinctrl-names = "default";
+-	pinctrl-0 = <&pwm0_pins>;
++	pinctrl-0 = <&pwm0_pins>, <&pwm6_pins>;
+ 	status = "okay";
+ };

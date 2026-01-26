@@ -1,0 +1,7 @@
+--- a/drivers/net/phy/sfp-quirks.c
++++ b/drivers/net/phy/sfp-quirks.c
+@@ -401,6 +401,7 @@
+ 	SFP_QUIRK_F("HUAWEI", "MA5671A", sfp_quirk_2500base_x),
+ 	SFP_QUIRK_F("ODI", "DFP-34X-2C2", sfp_quirk_2500base_x),
++	SFP_QUIRK_F("ODI", "DFP-34X-2C3", sfp_quirk_2500base_x),
+ 	SFP_QUIRK_M("SFP-GE-T", sfp_quirk_1000base_t),
