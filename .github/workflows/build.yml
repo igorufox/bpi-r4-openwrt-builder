@@ -20,19 +20,29 @@ jobs:
         run: |
           git clone --depth 1 -b v25.12.0-rc3 https://github.com/openwrt/openwrt.git openwrt
 
+      # --- БЛОК КЭШИРОВАНИЯ ---
+      - name: Cache Toolchain & DL
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/staging_dir
+            openwrt/build_dir/host
+          key: ${{ runner.os }}-openwrt-bpi-r4-${{ hashFiles('openwrt/feeds.conf.default') }}
+          restore-keys: |
+            ${{ runner.os }}-openwrt-bpi-r4-
+      # ------------------------
+
       - name: Update and Install Feeds
         run: |
           cd openwrt
-          # Переключаемся на зеркала GitHub, чтобы обойти ошибку 503
           sed -i 's|https://git.openwrt.org/feed/|https://github.com/openwrt/|g' feeds.conf.default
           sed -i 's|https://git.openwrt.org/project/|https://github.com/openwrt/|g' feeds.conf.default
-          
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
       - name: Apply Custom Patches
         run: |
-          # Путь для патчей ядра 6.12 (актуально для 25.12-rc3 на Mediatek)
           mkdir -p openwrt/target/linux/mediatek/patches-6.12
           [ -d patches ] && cp patches/*.patch openwrt/target/linux/mediatek/patches-6.12/
           echo "Patches applied."
@@ -40,25 +50,18 @@ jobs:
       - name: Generate Configuration
         run: |
           cd openwrt
-          # Настройка под Banana Pi R4
           echo "CONFIG_TARGET_mediatek=y" > .config
           echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
           echo "CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y" >> .config
-          
-          # Базовый набор (LuCI + SSL)
           echo "CONFIG_PACKAGE_luci=y" >> .config
           echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
-          
-          # Добавляем ACME и Nginx (раз уж они были нужны)
           echo "CONFIG_PACKAGE_luci-app-acme=y" >> .config
           echo "CONFIG_PACKAGE_nginx-ssl=y" >> .config
-          
           make defconfig
 
       - name: Build Firmware
         run: |
           cd openwrt
-          # Сборка. В случае ошибки V=s покажет подробности
           make -j$(nproc) || make -j1 V=s
 
       - name: Upload Artifacts
