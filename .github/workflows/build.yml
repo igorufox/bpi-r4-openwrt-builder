@@ -31,7 +31,6 @@ jobs:
       - name: Update Feeds
         run: |
           cd openwrt
-          # Лечим зеркала и выкидываем video
           sed -i 's|https://git.openwrt.org/feed/|https://github.com/openwrt/|g' feeds.conf.default
           sed -i 's|https://git.openwrt.org/project/|https://github.com/openwrt/|g' feeds.conf.default
           sed -i '/video/d' feeds.conf.default
@@ -50,46 +49,58 @@ jobs:
           echo "CONFIG_PACKAGE_nginx-ssl=y" >> .config
           make defconfig
 
-      - name: Unpack Kernel and Patch (The Reliable Way)
+      - name: Unpack and Patch (Correct Files)
         run: |
           cd openwrt
           
-          # 1. Сначала правим DTS (он всегда на месте, так как лежит в репозитории OpenWrt)
-          DTS="target/linux/mediatek/files-6.12/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts"
-          if [ -f "$DTS" ]; then
-            echo "Patching DTS at $DTS..."
-            echo -e "\n&pio {\n\tpwm6_pins: pwm6-pins {\n\t\tmux {\n\t\t\tfunction = \"pwm\";\n\t\t\tgroups = \"pwm6\";\n\t\t};\n\t};\n};\n\n&pwm {\n\tpinctrl-0 = <&pwm0_pins>, <&pwm6_pins>;\n\tstatus = \"okay\";\n};" >> "$DTS"
-          else
-            echo "FATAL: DTS file not found!"
-            exit 1
-          fi
-
-          # 2. ПРИНУДИТЕЛЬНО распаковываем ядро, чтобы файлы физически появились
-          echo "Unpacking kernel sources... (Wait ~2-3 mins)"
+          # 1. Распаковываем ядро (чтобы файлы появились физически)
+          echo "Unpacking kernel sources..."
           make target/linux/prepare V=s
           
-          # 3. Ищем sfp-quirks.c в папке build_dir (где бы он ни был)
-          echo "Searching for unpacked kernel..."
-          SFP_FILE=$(find build_dir -name sfp-quirks.c | grep "drivers/net/phy" | head -n 1)
+          # 2. Заходим в директорию с ядром 6.12
+          cd build_dir/target-*/linux-*/linux-6.12*
+          echo "Working in kernel dir: $(pwd)"
           
-          if [ -z "$SFP_FILE" ]; then
-             echo "FATAL: Could not find sfp-quirks.c anywhere in build_dir!"
+          # 3. ПРАВИМ SFP (ODI) - Файл теперь sfp.c!
+          # В ядре 6.12 таблица квирков находится прямо в sfp.c
+          if [ -f "drivers/net/phy/sfp.c" ]; then
+             echo "Patching sfp.c..."
+             # Вставляем ODI сразу после HUAWEI MA5671A
+             sed -i '/"MA5671A"/a \	SFP_QUIRK_F("ODI", "DFP-34X-2C3", sfp_quirk_2500base_x),' drivers/net/phy/sfp.c
+             grep "DFP-34X-2C3" drivers/net/phy/sfp.c && echo "SFP Patch Applied."
+          else
+             echo "FATAL: drivers/net/phy/sfp.c not found!"
+             ls drivers/net/phy/
              exit 1
           fi
-          
-          echo "Found SFP file at: $SFP_FILE"
-          
-          # 4. Вживляем ODI патч через sed
-          # Ищем строку с HUAWEI MA5671A и добавляем твой ODI сразу после неё
-          sed -i '/"MA5671A"/a \	SFP_QUIRK_F("ODI", "DFP-34X-2C3", sfp_quirk_2500base_x),' "$SFP_FILE"
-          
-          # Проверка (выведет строки в лог, чтобы мы убедились)
-          grep -C 2 "DFP-34X-2C3" "$SFP_FILE" || echo "WARNING: Grep check failed"
+
+          # 4. ПРАВИМ DTS (Вентилятор PWM6)
+          if [ -f "arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts" ]; then
+             echo "Patching DTS..."
+             cat << 'EOF_DTS' >> arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts
+
+          &pio {
+              pwm6_pins: pwm6-pins {
+                  mux {
+                      function = "pwm";
+                      groups = "pwm6";
+                  };
+              };
+          };
+
+          &pwm {
+              pinctrl-0 = <&pwm0_pins>, <&pwm6_pins>;
+              status = "okay";
+          };
+          EOF_DTS
+          else
+             echo "FATAL: DTS file not found!"
+             exit 1
+          fi
 
       - name: Build Firmware
         run: |
           cd openwrt
-          # Игнорируем ошибки сборки пакетов, если они не критичны (-k)
           make -j$(nproc) || make -j1 V=s
 
       - name: Upload Artifacts
