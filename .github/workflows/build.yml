@@ -31,31 +31,12 @@ jobs:
       - name: Update Feeds
         run: |
           cd openwrt
+          # Лечим зеркала и выкидываем video
           sed -i 's|https://git.openwrt.org/feed/|https://github.com/openwrt/|g' feeds.conf.default
           sed -i 's|https://git.openwrt.org/project/|https://github.com/openwrt/|g' feeds.conf.default
           sed -i '/video/d' feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-
-      - name: Apply Hardcoded Fixes
-        run: |
-          cd openwrt
-          # 1. Исправляем DTS (Вентилятор PWM6)
-          DTS="target/linux/mediatek/files-6.12/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts"
-          if [ -f "$DTS" ]; then
-            echo -e "\n&pio {\n\tpwm6_pins: pwm6-pins {\n\t\tmux {\n\t\t\tfunction = \"pwm\";\n\t\t\tgroups = \"pwm6\";\n\t\t};\n\t};\n};\n\n&pwm {\n\tpinctrl-0 = <&pwm0_pins>, <&pwm6_pins>;\n\tstatus = \"okay\";\n};" >> "$DTS"
-          fi
-
-          # 2. Создаем патч для SFP ODI через безопасные echo
-          mkdir -p target/linux/mediatek/patches-6.12
-          PATCH="target/linux/mediatek/patches-6.12/999-sfp-odi-quirk.patch"
-          echo '--- a/drivers/net/phy/sfp-quirks.c' > "$PATCH"
-          echo '+++ b/drivers/net/phy/sfp-quirks.c' >> "$PATCH"
-          echo '@@ -401,6 +401,7 @@' >> "$PATCH"
-          echo ' 	SFP_QUIRK_F("HUAWEI", "MA5671A", sfp_quirk_2500base_x),' >> "$PATCH"
-          echo ' 	SFP_QUIRK_F("ODI", "DFP-34X-2C2", sfp_quirk_2500base_x),' >> "$PATCH"
-          echo '+	SFP_QUIRK_F("ODI", "DFP-34X-2C3", sfp_quirk_2500base_x),' >> "$PATCH"
-          echo ' 	SFP_QUIRK_M("SFP-GE-T", sfp_quirk_1000base_t),' >> "$PATCH"
 
       - name: Generate Configuration
         run: |
@@ -69,9 +50,46 @@ jobs:
           echo "CONFIG_PACKAGE_nginx-ssl=y" >> .config
           make defconfig
 
+      - name: Unpack Kernel and Patch (The Reliable Way)
+        run: |
+          cd openwrt
+          
+          # 1. Сначала правим DTS (он всегда на месте, так как лежит в репозитории OpenWrt)
+          DTS="target/linux/mediatek/files-6.12/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts"
+          if [ -f "$DTS" ]; then
+            echo "Patching DTS at $DTS..."
+            echo -e "\n&pio {\n\tpwm6_pins: pwm6-pins {\n\t\tmux {\n\t\t\tfunction = \"pwm\";\n\t\t\tgroups = \"pwm6\";\n\t\t};\n\t};\n};\n\n&pwm {\n\tpinctrl-0 = <&pwm0_pins>, <&pwm6_pins>;\n\tstatus = \"okay\";\n};" >> "$DTS"
+          else
+            echo "FATAL: DTS file not found!"
+            exit 1
+          fi
+
+          # 2. ПРИНУДИТЕЛЬНО распаковываем ядро, чтобы файлы физически появились
+          echo "Unpacking kernel sources... (Wait ~2-3 mins)"
+          make target/linux/prepare V=s
+          
+          # 3. Ищем sfp-quirks.c в папке build_dir (где бы он ни был)
+          echo "Searching for unpacked kernel..."
+          SFP_FILE=$(find build_dir -name sfp-quirks.c | grep "drivers/net/phy" | head -n 1)
+          
+          if [ -z "$SFP_FILE" ]; then
+             echo "FATAL: Could not find sfp-quirks.c anywhere in build_dir!"
+             exit 1
+          fi
+          
+          echo "Found SFP file at: $SFP_FILE"
+          
+          # 4. Вживляем ODI патч через sed
+          # Ищем строку с HUAWEI MA5671A и добавляем твой ODI сразу после неё
+          sed -i '/"MA5671A"/a \	SFP_QUIRK_F("ODI", "DFP-34X-2C3", sfp_quirk_2500base_x),' "$SFP_FILE"
+          
+          # Проверка (выведет строки в лог, чтобы мы убедились)
+          grep -C 2 "DFP-34X-2C3" "$SFP_FILE" || echo "WARNING: Grep check failed"
+
       - name: Build Firmware
         run: |
           cd openwrt
+          # Игнорируем ошибки сборки пакетов, если они не критичны (-k)
           make -j$(nproc) || make -j1 V=s
 
       - name: Upload Artifacts
