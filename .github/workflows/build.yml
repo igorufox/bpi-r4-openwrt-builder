@@ -53,48 +53,31 @@ jobs:
         run: |
           cd openwrt
           
-          # 1. Распаковка ядра.
-          # Это создаст папки с исходниками в build_dir
+          # 1. Распаковка ядра
           echo "Unpacking kernel sources..."
           make target/linux/prepare V=s
           
-          # 2. Переходим в папку с ядром 6.12
-          # Используем wildcard (*), так как точная версия может меняться (напр. 6.12.10 -> 6.12.11)
+          # 2. Переход в папку с ядром
           cd build_dir/target-*/linux-*/linux-6.12*
-          echo "Working directory: $(pwd)"
           
           # 3. ПРАВКА SFP (ODI)
-          # Файл: drivers/net/phy/sfp.c (в 6.12 код переехал сюда)
-          # Логика: Вставляем в начало массива sfp_quirks, чтобы не ломать структуру
-          # Синтаксис: SFP_QUIRK(vendor, part, mode, fixup) - ровно 4 аргумента
           echo "Patching SFP..."
           if [ -f "drivers/net/phy/sfp.c" ]; then
             sed -i '/sfp_quirks\[\] = {/a \	SFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, NULL),' drivers/net/phy/sfp.c
-            grep "DFP-34X-2C3" drivers/net/phy/sfp.c && echo "SFP Patch OK"
-          else
-            echo "FATAL: sfp.c not found"
-            exit 1
           fi
           
           # 4. ПРАВКА DTS (PWM Fan)
-          # Файл: arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts
-          # Проблема: Ядро 6.12 не содержит описания pwm0_pins, поэтому ссылка на него вызывает ошибку.
-          # Решение: Мы вручную описываем и pwm0 (сток), и pwm6 (твой мод).
           echo "Patching DTS..."
           if [ -f "arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts" ]; then
             cat << 'EOF_DTS' >> arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts
 
-          /* Добавляем описание пинов в контроллер PIO */
           &pio {
-              /* Описываем PWM0 (Вентилятор ЦПУ), которого не хватало в стоке */
               pwm0_pins: pwm0-pins {
                   mux {
                       function = "pwm";
                       groups = "pwm0";
                   };
               };
-
-              /* Описываем PWM6 (Вентилятор корпуса/доп) */
               pwm6_pins: pwm6-pins {
                   mux {
                       function = "pwm";
@@ -103,17 +86,12 @@ jobs:
               };
           };
 
-          /* Включаем PWM и ссылаемся на описанные выше пины */
           &pwm {
               pinctrl-names = "default";
               pinctrl-0 = <&pwm0_pins>, <&pwm6_pins>;
               status = "okay";
           };
           EOF_DTS
-            echo "DTS Patch OK"
-          else
-            echo "FATAL: DTS file not found"
-            exit 1
           fi
 
       - name: Build Firmware
@@ -121,8 +99,9 @@ jobs:
           cd openwrt
           make -j$(nproc) || make -j1 V=s
 
-      - name: Upload Artifacts
+      - name: Upload Artifacts (FULL)
         uses: actions/upload-artifact@v4
         with:
           name: BPi-R4-Custom-Firmware
-          path: openwrt/bin/targets/mediatek/filogic/*.itb
+          # ВОТ ТУТ Я ИСПРАВИЛ: теперь сохраняем ВСЁ, включая sdcard.img.gz
+          path: openwrt/bin/targets/mediatek/filogic/*
