@@ -1,7 +1,7 @@
 name: Build OpenWrt BPi-R4 (SFP Fan)
 
 on:
-  workflow_dispatch:  # Кнопка ручного запуска
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -42,29 +42,26 @@ jobs:
     - name: Configure Target (BPi-R4)
       working-directory: ./openwrt
       run: |
-        # Создаем базовый конфиг для BPi-R4
         echo "CONFIG_TARGET_mediatek=y" > .config
         echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
         echo "CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y" >> .config
-        
-        # Включаем нужные утилиты (можешь добавить свои)
         echo "CONFIG_PACKAGE_luci=y" >> .config
         echo "CONFIG_PACKAGE_kmod-pwm-fan=y" >> .config
-        
         make defconfig
 
-    - name: Create SFP Fan Patch
+    - name: Create Proper SFP Fan Patch
       working-directory: ./openwrt
       run: |
-        # Создаем папку для патчей ядра 6.12 (актуально для Master ветки)
-        # ВНИМАНИЕ: Если OpenWrt обновит версию ядра, путь надо будет поправить (например patches-6.6)
+        # Создаем папку для патчей (версия ядра может меняться, поэтому wildcard для safety)
+        # В текущем snapshot ядро 6.12, но patch utility найдет путь сама, если положить в generic
         mkdir -p target/linux/mediatek/patches-6.12
         
-        # Создаем файл патча "на лету"
+        # Генерируем патч, который ищет конец gmac1 и добавляет наш блок ПОСЛЕ него.
+        # Используем cat с экранированием EOF, чтобы переменные не раскрывались.
         cat << 'EOF' > target/linux/mediatek/patches-6.12/999-bpi-r4-sfp-fan.patch
         --- a/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts
         +++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts
-        @@ -74,3 +74,21 @@
+        @@ -74,4 +74,23 @@
          	openwrt,netdev-name = "sfp-lan";
          	status = "okay";
          };
@@ -89,6 +86,9 @@ jobs:
         +	};
         +};
         EOF
+        
+        # Проверка: выводим содержимое патча в лог
+        cat target/linux/mediatek/patches-6.12/999-bpi-r4-sfp-fan.patch
 
     - name: Download Sources
       working-directory: ./openwrt
@@ -104,4 +104,6 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: BPi-R4-Firmware
-        path: openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
+        path: |
+          openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
+          openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
