@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (Final Fix)
+name: Build OpenWrt BPi-R4 (v25.12-rc4 + ODI + Fan)
 
 on:
   workflow_dispatch:
@@ -32,17 +32,13 @@ jobs:
         gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
         file wget
 
-    - name: Clone OpenWrt Source
+    - name: Clone OpenWrt Source (Tag v25.12.0-rc4)
       run: |
-        # Используем GitHub-зеркало.
-        # --depth 1 для скорости и стабильности.
-        git clone --depth 1 https://github.com/openwrt/openwrt.git openwrt
+        # СТРОГО v25.12.0-rc4
+        git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
         
         cd openwrt
-        
-        # Удаляем проблемный фид video
         sed -i '/src-git video/d' feeds.conf.default
-        
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
@@ -54,29 +50,40 @@ jobs:
         echo "CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y" >> .config
         echo "CONFIG_PACKAGE_luci=y" >> .config
         echo "CONFIG_PACKAGE_kmod-pwm-fan=y" >> .config
+        echo "CONFIG_PACKAGE_ethtool-full=y" >> .config 
         make defconfig
 
-    - name: Apply SFP Fan Mod (Direct Write)
+    - name: Apply ODI SFP Patch (Only ODI)
       working-directory: ./openwrt
       run: |
-        # 1. Распаковываем ядро
+        PATCH_DIR=$(find target/linux/mediatek -maxdepth 1 -type d -name "patches-6.*" | sort -r | head -n 1)
+        if [ -z "$PATCH_DIR" ]; then echo "ERROR: Patch dir not found!"; exit 1; fi
+        
+        # Патчим ТОЛЬКО ODI (2C2 и 2C3)
+        cat << 'EOF' > "$PATCH_DIR/999-sfp-odi-quirk.patch"
+        --- a/drivers/net/phy/sfp.c
+        +++ b/drivers/net/phy/sfp.c
+        @@ -450,6 +450,9 @@ static const struct sfp_quirk sfp_quirk_oem_modes[] = {
+         	{ "HUAWEI", "MA5671A", sfp_quirk_2500basex },
+         	{ "ALCATELLUCENT", "3FE46541AA", sfp_quirk_2500basex },
+         	{ "NOKIA", "3FE46541AA", sfp_quirk_2500basex },
+        +	// ODI Realtek Sticks Only
+        +	{ "ODI", "DFP-34X-2C2", sfp_quirk_2500basex },
+        +	{ "ODI", "DFP-34X-2C3", sfp_quirk_2500basex },
+         };
+         
+         static const struct sfp_quirk *sfp_lookup_quirk(const struct sfp_eeprom_id *id)
+        EOF
+
+    - name: Apply Fan DTS (5 Steps)
+      working-directory: ./openwrt
+      run: |
         make target/linux/prepare V=s
-        
-        # 2. Ищем файл DTS
         DTS_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
+        if [ -z "$DTS_FILE" ]; then echo "ERROR: DTS not found!"; exit 1; fi
         
-        if [ -z "$DTS_FILE" ]; then
-          echo "ERROR: DTS file not found!"
-          exit 1
-        fi
-        
-        echo "Modifying file: $DTS_FILE"
-        
-        # 3. Дописываем блок в конец файла
         cat << 'EOF' >> "$DTS_FILE"
-
-        /* --- SFP FAN MOD START --- */
-
+        /* --- SFP FAN DEFINITION --- */
         &pio {
             pwm6_pins: pwm6-pins {
                 mux {
@@ -85,18 +92,77 @@ jobs:
                 };
             };
         };
-
         / {
             sfp_fan: sfp-fan {
                 compatible = "pwm-fan";
                 pwms = <&pwm 6 50000>;
                 pinctrl-names = "default";
                 pinctrl-0 = <&pwm6_pins>;
-                cooling-levels = <0 100 255>;
+                cooling-levels = <0 75 125 180 255>;
                 #cooling-cells = <2>;
             };
         };
         EOF
+
+    - name: Create Fan Control Script
+      working-directory: ./openwrt
+      run: |
+        mkdir -p package/base-files/files/etc/init.d/
+        cat << 'EOF' > package/base-files/files/etc/init.d/fan_control
+        #!/bin/sh /etc/rc.common
+        START=99
+        USE_PROCD=1
+        
+        start_service() {
+            procd_open_instance
+            procd_set_param command /bin/sh -c '
+                FAN_DEV="/sys/class/thermal/cooling_device1/cur_state"
+                # Проверка, что device1 - это вентилятор (4 скорости: 0..4)
+                if [ "$(cat /sys/class/thermal/cooling_device1/max_state)" != "4" ]; then
+                    for d in /sys/class/thermal/cooling_device*; do
+                        if [ "$(cat $d/max_state)" = "4" ]; then FAN_DEV="$d/cur_state"; break; fi
+                    done
+                fi
+
+                while true; do
+                    MAX_TEMP=0
+                    # Температура Wi-Fi
+                    for hw in /sys/class/hwmon/hwmon*; do
+                        NAME=$(cat "$hw/name" 2>/dev/null)
+                        if echo "$NAME" | grep -q "mt7996"; then
+                            for t in "$hw"/temp*_input; do
+                                [ -f "$t" ] || continue
+                                TEMP=$(cat "$t"); TEMP=$((TEMP / 1000))
+                                if [ "$TEMP" -gt "$MAX_TEMP" ]; then MAX_TEMP=$TEMP; fi
+                            done
+                        fi
+                    done
+                    
+                    # Резерв CPU
+                    if [ "$MAX_TEMP" -eq 0 ]; then
+                        CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
+                        MAX_TEMP=$((CPU_T / 1000))
+                    fi
+
+                    # Логика 5 скоростей (0, 75, 125, 180, 255)
+                    if [ "$MAX_TEMP" -ge 68 ]; then NEW=4
+                    elif [ "$MAX_TEMP" -ge 60 ]; then NEW=3
+                    elif [ "$MAX_TEMP" -ge 52 ]; then NEW=2
+                    elif [ "$MAX_TEMP" -ge 45 ]; then NEW=1
+                    elif [ "$MAX_TEMP" -le 40 ]; then NEW=0
+                    else CUR=$(cat "$FAN_DEV"); if [ "$CUR" -gt 0 ]; then NEW="$CUR"; else NEW=0; fi
+                    fi
+
+                    CUR_STATE=$(cat "$FAN_DEV")
+                    if [ "$CUR_STATE" != "$NEW" ]; then echo "$NEW" > "$FAN_DEV"; fi
+                    sleep 5
+                done
+            '
+            procd_set_param respawn
+            procd_close_instance
+        }
+        EOF
+        chmod +x package/base-files/files/etc/init.d/fan_control
 
     - name: Download Sources
       working-directory: ./openwrt
@@ -105,13 +171,12 @@ jobs:
     - name: Compile Firmware
       working-directory: ./openwrt
       run: |
-        # Убраны все echo, чтобы не ломать YAML кавычками
         make -j$(nproc) || make -j1 V=s
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPi-R4-Firmware
+        name: BPi-R4-v25.12-rc4-Final
         path: |
           openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
           openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
