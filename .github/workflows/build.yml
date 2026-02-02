@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (SFP Fan)
+name: Build OpenWrt BPi-R4 (Final Fix)
 
 on:
   workflow_dispatch:
@@ -34,13 +34,13 @@ jobs:
 
     - name: Clone OpenWrt Source
       run: |
-        # Используем GitHub зеркало (официальный git часто лежит)
-        # --depth 1 ускоряет загрузку и предотвращает обрывы связи
+        # Используем GitHub-зеркало.
+        # --depth 1 для скорости и стабильности.
         git clone --depth 1 https://github.com/openwrt/openwrt.git openwrt
         
         cd openwrt
         
-        # Удаляем глючный фид video (он сейчас ломает сборку и не нужен роутеру)
+        # Удаляем проблемный фид video
         sed -i '/src-git video/d' feeds.conf.default
         
         ./scripts/feeds update -a
@@ -56,13 +56,13 @@ jobs:
         echo "CONFIG_PACKAGE_kmod-pwm-fan=y" >> .config
         make defconfig
 
-    - name: Apply SFP Fan Modification
+    - name: Apply SFP Fan Mod (Direct Write)
       working-directory: ./openwrt
       run: |
-        # 1. Распаковываем ядро, чтобы файлы .dts появились физически
+        # 1. Распаковываем ядро
         make target/linux/prepare V=s
         
-        # 2. Находим файл устройства (независимо от версии ядра 6.6 или 6.12)
+        # 2. Ищем файл DTS
         DTS_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
         
         if [ -z "$DTS_FILE" ]; then
@@ -70,10 +70,9 @@ jobs:
           exit 1
         fi
         
-        echo "Patching file: $DTS_FILE"
+        echo "Modifying file: $DTS_FILE"
         
-        # 3. Дописываем настройки вентилятора в конец файла.
-        # Это 100% надежнее, чем .patch файл, так как не зависит от пробелов/табов в YAML.
+        # 3. Дописываем блок в конец файла
         cat << 'EOF' >> "$DTS_FILE"
 
         /* --- SFP FAN MOD START --- */
@@ -98,9 +97,6 @@ jobs:
             };
         };
         EOF
-        
-        # Контрольный выстрел: проверяем, что записалось
-        tail -n 20 "$DTS_FILE"
 
     - name: Download Sources
       working-directory: ./openwrt
@@ -109,4 +105,13 @@ jobs:
     - name: Compile Firmware
       working-directory: ./openwrt
       run: |
-        echo -e "$(nproc)
+        # Убраны все echo, чтобы не ломать YAML кавычками
+        make -j$(nproc) || make -j1 V=s
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: BPi-R4-Firmware
+        path: |
+          openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
+          openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
