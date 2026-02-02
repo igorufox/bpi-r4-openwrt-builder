@@ -1,74 +1,107 @@
-name: Build BPI-R4 (v25.12.0-rc4 + DEVMEM)
+name: Build OpenWrt BPi-R4 (SFP Fan)
 
 on:
-  workflow_dispatch:
-
-env:
-  REPO_URL: https://github.com/openwrt/openwrt
-  # Тот самый тэг, о котором ты говорил
-  REPO_TAG: v25.12.0-rc4
+  workflow_dispatch:  # Кнопка ручного запуска
+  push:
+    branches:
+      - main
+      - master
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
+    
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v3
 
-    - name: Prepare Environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-        gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
+    - name: Free Disk Space (Ubuntu)
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        swap-storage: true
 
-    - name: Clone Source (Tag v25.12.0-rc4)
+    - name: Install Dependencies
       run: |
-        git clone $REPO_URL -b $REPO_TAG openwrt
+        sudo apt update
+        sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+        gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
+        file wget
 
-    - name: Update Feeds
+    - name: Clone OpenWrt Source
       run: |
+        git clone https://git.openwrt.org/openwrt/openwrt.git openwrt
         cd openwrt
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: Configure (Enable DEVMEM & PWM)
+    - name: Configure Target (BPi-R4)
+      working-directory: ./openwrt
       run: |
-        cd openwrt
-        # Настройка под BPI-R4
+        # Создаем базовый конфиг для BPi-R4
         echo "CONFIG_TARGET_mediatek=y" > .config
         echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
         echo "CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y" >> .config
         
-        # !!! ГЛАВНОЕ: Открываем доступ к регистрам !!!
-        echo "CONFIG_KERNEL_DEVMEM=y" >> .config
-        echo "CONFIG_STRICT_DEVMEM=n" >> .config
-        echo "CONFIG_IO_STRICT_DEVMEM=n" >> .config
-        
-        # Инструменты и модули
-        echo "CONFIG_PACKAGE_io=y" >> .config
-        echo "CONFIG_PACKAGE_kmod-pwm-mediatek-mt7988=y" >> .config
+        # Включаем нужные утилиты (можешь добавить свои)
+        echo "CONFIG_PACKAGE_luci=y" >> .config
         echo "CONFIG_PACKAGE_kmod-pwm-fan=y" >> .config
         
-        # Применяем конфиг
         make defconfig
 
-    - name: Download Packages
+    - name: Create SFP Fan Patch
+      working-directory: ./openwrt
       run: |
-        cd openwrt
-        make download -j8
+        # Создаем папку для патчей ядра 6.12 (актуально для Master ветки)
+        # ВНИМАНИЕ: Если OpenWrt обновит версию ядра, путь надо будет поправить (например patches-6.6)
+        mkdir -p target/linux/mediatek/patches-6.12
+        
+        # Создаем файл патча "на лету"
+        cat << 'EOF' > target/linux/mediatek/patches-6.12/999-bpi-r4-sfp-fan.patch
+        --- a/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts
+        +++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts
+        @@ -74,3 +74,21 @@
+         	openwrt,netdev-name = "sfp-lan";
+         	status = "okay";
+         };
+        +
+        +&pio {
+        +	pwm6_pins: pwm6-pins {
+        +		mux {
+        +			function = "pwm";
+        +			groups = "pwm6_0";
+        +		};
+        +	};
+        +};
+        +
+        +/ {
+        +	sfp_fan: sfp-fan {
+        +		compatible = "pwm-fan";
+        +		pwms = <&pwm 6 50000>;
+        +		pinctrl-names = "default";
+        +		pinctrl-0 = <&pwm6_pins>;
+        +		cooling-levels = <0 100 255>;
+        +		#cooling-cells = <2>;
+        +	};
+        +};
+        EOF
 
-    - name: Compile
+    - name: Download Sources
+      working-directory: ./openwrt
+      run: make download -j8
+
+    - name: Compile Firmware
+      working-directory: ./openwrt
       run: |
-        cd openwrt
         echo -e "$(nproc) thread compile"
         make -j$(nproc) || make -j1 V=s
 
-    - name: Upload Firmware
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPI-R4-25.12-RC4-DEVMEM
-        path: openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
+        name: BPi-R4-Firmware
+        path: openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
