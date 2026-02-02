@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (SFP Fan)
+name: Build OpenWrt BPi-R4 (Tag v25.12.0-rc4)
 
 on:
   workflow_dispatch:
@@ -32,10 +32,19 @@ jobs:
         gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
         file wget
 
-    - name: Clone OpenWrt Source
+    - name: Clone OpenWrt Source (Tag v25.12.0-rc4)
       run: |
-        git clone https://git.openwrt.org/openwrt/openwrt.git openwrt
+        # Клонируем КОНКРЕТНЫЙ ТЕГ. Если такого тега нет, git упадет с ошибкой.
+        # Используем --depth 1 для скорости.
+        git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
+        
         cd openwrt
+        
+        # На всякий случай вырезаем video фид, который часто ломается, если он есть
+        if grep -q "src-git video" feeds.conf.default; then
+          sed -i '/src-git video/d' feeds.conf.default
+        fi
+        
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
@@ -49,19 +58,27 @@ jobs:
         echo "CONFIG_PACKAGE_kmod-pwm-fan=y" >> .config
         make defconfig
 
-    - name: Create Proper SFP Fan Patch
+    - name: Create SFP Fan Patch (Auto-detect Kernel)
       working-directory: ./openwrt
       run: |
-        # Создаем папку для патчей (версия ядра может меняться, поэтому wildcard для safety)
-        # В текущем snapshot ядро 6.12, но patch utility найдет путь сама, если положить в generic
-        mkdir -p target/linux/mediatek/patches-6.12
+        # АВТОМАТИКА: Ищем папку с патчами для текущего ядра (6.6 или 6.12 или др)
+        # Находим первую попавшуюся папку patches-6.* внутри target/linux/mediatek/
+        PATCH_DIR=$(find target/linux/mediatek -maxdepth 1 -type d -name "patches-6.*" | sort -r | head -n 1)
         
-        # Генерируем патч, который ищет конец gmac1 и добавляет наш блок ПОСЛЕ него.
-        # Используем cat с экранированием EOF, чтобы переменные не раскрывались.
-        cat << 'EOF' > target/linux/mediatek/patches-6.12/999-bpi-r4-sfp-fan.patch
+        if [ -z "$PATCH_DIR" ]; then
+            echo "CRITICAL ERROR: Could not find kernel patch directory!"
+            exit 1
+        fi
+        
+        echo "Detected Kernel Patch Directory: $PATCH_DIR"
+        
+        # Создаем патч в найденной папке
+        cat << 'EOF' > "$PATCH_DIR/999-bpi-r4-sfp-fan.patch"
         --- a/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts
         +++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts
         @@ -74,4 +74,23 @@
+         	managed = "in-band-status";
+         	phy-mode = "usxgmii";
          	openwrt,netdev-name = "sfp-lan";
          	status = "okay";
          };
@@ -87,8 +104,7 @@ jobs:
         +};
         EOF
         
-        # Проверка: выводим содержимое патча в лог
-        cat target/linux/mediatek/patches-6.12/999-bpi-r4-sfp-fan.patch
+        echo "Patch created successfully."
 
     - name: Download Sources
       working-directory: ./openwrt
@@ -103,7 +119,7 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPi-R4-Firmware
+        name: BPi-R4-Firmware-v25.12.0-rc4
         path: |
           openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
           openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
