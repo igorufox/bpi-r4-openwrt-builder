@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (Final Fix v2)
+name: Build OpenWrt BPi-R4 (Fix Feeds + SFP)
 
 on:
   workflow_dispatch:
@@ -36,7 +36,11 @@ jobs:
       run: |
         git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
         cd openwrt
+        
+        # УДАЛЯЕМ СЛОМАННЫЕ ФИДЫ
         sed -i '/src-git video/d' feeds.conf.default
+        sed -i '/src-git telephony/d' feeds.conf.default
+        
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
@@ -57,13 +61,13 @@ jobs:
         # 1. Распаковываем ядро
         make target/linux/prepare V=s
         
-        # 2. Ищем файл
+        # 2. Ищем файл sfp.c
         SFP_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/drivers/net/phy/ -name "sfp.c" -print -quit)
         if [ -z "$SFP_FILE" ]; then echo "ERROR: sfp.c missing"; exit 1; fi
         
         echo "Patching $SFP_FILE..."
         
-        # 3. Вставляем через SFP_QUIRK (синтаксис ядра 6.12) в начало массива
+        # 3. Вставляем через SFP_QUIRK (синтаксис ядра 6.12)
         sed -i '/sfp_quirk_oem_modes\[\] = {/a \
         \	SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault), \\
         \	SFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),' "$SFP_FILE"
@@ -168,7 +172,7 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPi-R4-v25.12-Final-Fix2
+        name: BPi-R4-v25.12-Final-NoTelephony
         path: |
           openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
           openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
