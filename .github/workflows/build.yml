@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (Fix Feeds + SFP)
+name: Build OpenWrt BPi-R4 (Force Feeds + Fix SFP)
 
 on:
   workflow_dispatch:
@@ -37,12 +37,13 @@ jobs:
         git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
         cd openwrt
         
-        # УДАЛЯЕМ СЛОМАННЫЕ ФИДЫ
+        # Удаляем проблемные фиды, чтобы не тратить время
         sed -i '/src-git video/d' feeds.conf.default
         sed -i '/src-git telephony/d' feeds.conf.default
         
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        # ВАЖНО: Добавляем "|| true", чтобы ошибка в каком-нибудь левом пакете не останавливала всю сборку
+        ./scripts/feeds update -a || true
+        ./scripts/feeds install -a || true
 
     - name: Configure Target (BPi-R4)
       working-directory: ./openwrt
@@ -58,21 +59,22 @@ jobs:
     - name: Inject ODI Support Directly
       working-directory: ./openwrt
       run: |
-        # 1. Распаковываем ядро
+        # 1. Распаковка ядра
         make target/linux/prepare V=s
         
-        # 2. Ищем файл sfp.c
+        # 2. Поиск файла sfp.c
         SFP_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/drivers/net/phy/ -name "sfp.c" -print -quit)
         if [ -z "$SFP_FILE" ]; then echo "ERROR: sfp.c missing"; exit 1; fi
         
         echo "Patching $SFP_FILE..."
         
-        # 3. Вставляем через SFP_QUIRK (синтаксис ядра 6.12)
+        # 3. Вставка ODI (используем синтаксис макросов SFP_QUIRK для ядра 6.12)
+        # Вставляем сразу после начала массива sfp_quirk_oem_modes
         sed -i '/sfp_quirk_oem_modes\[\] = {/a \
         \	SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault), \\
         \	SFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),' "$SFP_FILE"
         
-        # Проверка
+        # Проверка (выводим 5 строк после начала массива)
         grep -A 5 "sfp_quirk_oem_modes" "$SFP_FILE"
 
     - name: Apply Fan DTS (5 Steps)
@@ -118,6 +120,7 @@ jobs:
             procd_open_instance
             procd_set_param command /bin/sh -c '
                 FAN_DEV="/sys/class/thermal/cooling_device1/cur_state"
+                # Защита от смены ID устройства
                 if [ "$(cat /sys/class/thermal/cooling_device1/max_state)" != "4" ]; then
                     for d in /sys/class/thermal/cooling_device*; do
                         if [ "$(cat $d/max_state)" = "4" ]; then FAN_DEV="$d/cur_state"; break; fi
@@ -126,6 +129,7 @@ jobs:
 
                 while true; do
                     MAX_TEMP=0
+                    # WiFi Temp
                     for hw in /sys/class/hwmon/hwmon*; do
                         NAME=$(cat "$hw/name" 2>/dev/null)
                         if echo "$NAME" | grep -q "mt7996"; then
@@ -137,11 +141,13 @@ jobs:
                         fi
                     done
                     
+                    # CPU Fallback
                     if [ "$MAX_TEMP" -eq 0 ]; then
                         CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
                         MAX_TEMP=$((CPU_T / 1000))
                     fi
 
+                    # Logic: 0, 75(1), 125(2), 180(3), 255(4)
                     if [ "$MAX_TEMP" -ge 68 ]; then NEW=4
                     elif [ "$MAX_TEMP" -ge 60 ]; then NEW=3
                     elif [ "$MAX_TEMP" -ge 52 ]; then NEW=2
@@ -172,7 +178,7 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPi-R4-v25.12-Final-NoTelephony
+        name: BPi-R4-v25.12-Final-ForceFeeds
         path: |
           openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
           openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
