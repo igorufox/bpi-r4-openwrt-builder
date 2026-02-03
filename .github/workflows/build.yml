@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (Final Fix - Direct Injection)
+name: Build OpenWrt BPi-R4 (Final Fix v2)
 
 on:
   workflow_dispatch:
@@ -54,38 +54,27 @@ jobs:
     - name: Inject ODI Support Directly
       working-directory: ./openwrt
       run: |
-        # 1. Распаковываем исходники ядра (prepare)
-        echo "Unpacking kernel..."
+        # 1. Распаковываем ядро
         make target/linux/prepare V=s
         
-        # 2. Находим файл драйвера sfp.c
+        # 2. Ищем файл
         SFP_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/drivers/net/phy/ -name "sfp.c" -print -quit)
+        if [ -z "$SFP_FILE" ]; then echo "ERROR: sfp.c missing"; exit 1; fi
         
-        if [ -z "$SFP_FILE" ]; then
-          echo "CRITICAL ERROR: sfp.c not found!"
-          exit 1
-        fi
+        echo "Patching $SFP_FILE..."
         
-        echo "Modifying driver: $SFP_FILE"
+        # 3. Вставляем через SFP_QUIRK (синтаксис ядра 6.12) в начало массива
+        sed -i '/sfp_quirk_oem_modes\[\] = {/a \
+        \	SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault), \\
+        \	SFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),' "$SFP_FILE"
         
-        # 3. Вставляем поддержку ODI.
-        # Ищем строку с HUAWEI и добавляем после неё наши ODI.
-        # Это надежнее патча, так как игнорирует проблемы с пробелами в YAML.
-        
-        sed -i '/"HUAWEI", "MA5671A"/a \
-        \	{ "ODI", "DFP-34X-2C2", sfp_quirk_2500basex },\
-        \	{ "ODI", "DFP-34X-2C3", sfp_quirk_2500basex },' "$SFP_FILE"
-        
-        # Проверяем результат (выводим 5 строк вокруг HUAWEI)
-        echo "Checking modification:"
-        grep -C 3 "ODI" "$SFP_FILE" || echo "WARNING: Injection might have failed, please check logs."
+        # Проверка
+        grep -A 5 "sfp_quirk_oem_modes" "$SFP_FILE"
 
     - name: Apply Fan DTS (5 Steps)
       working-directory: ./openwrt
       run: |
-        # DTS файл лежит в распакованном ядре
         DTS_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
-        
         if [ -z "$DTS_FILE" ]; then echo "ERROR: DTS not found!"; exit 1; fi
         
         cat << 'EOF' >> "$DTS_FILE"
@@ -116,7 +105,6 @@ jobs:
       working-directory: ./openwrt
       run: |
         mkdir -p package/base-files/files/etc/init.d/
-        
         cat << 'EOF' > package/base-files/files/etc/init.d/fan_control
         #!/bin/sh /etc/rc.common
         START=99
@@ -126,7 +114,6 @@ jobs:
             procd_open_instance
             procd_set_param command /bin/sh -c '
                 FAN_DEV="/sys/class/thermal/cooling_device1/cur_state"
-                # Проверка: если device1 - не вентилятор (нет 4 скоростей), ищем правильный
                 if [ "$(cat /sys/class/thermal/cooling_device1/max_state)" != "4" ]; then
                     for d in /sys/class/thermal/cooling_device*; do
                         if [ "$(cat $d/max_state)" = "4" ]; then FAN_DEV="$d/cur_state"; break; fi
@@ -135,7 +122,6 @@ jobs:
 
                 while true; do
                     MAX_TEMP=0
-                    # WiFi Temp
                     for hw in /sys/class/hwmon/hwmon*; do
                         NAME=$(cat "$hw/name" 2>/dev/null)
                         if echo "$NAME" | grep -q "mt7996"; then
@@ -147,13 +133,11 @@ jobs:
                         fi
                     done
                     
-                    # CPU Fallback
                     if [ "$MAX_TEMP" -eq 0 ]; then
                         CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
                         MAX_TEMP=$((CPU_T / 1000))
                     fi
 
-                    # Logic: 0, 75(1), 125(2), 180(3), 255(4)
                     if [ "$MAX_TEMP" -ge 68 ]; then NEW=4
                     elif [ "$MAX_TEMP" -ge 60 ]; then NEW=3
                     elif [ "$MAX_TEMP" -ge 52 ]; then NEW=2
@@ -162,8 +146,7 @@ jobs:
                     else CUR=$(cat "$FAN_DEV"); if [ "$CUR" -gt 0 ]; then NEW="$CUR"; else NEW=0; fi
                     fi
 
-                    CUR_STATE=$(cat "$FAN_DEV")
-                    if [ "$CUR_STATE" != "$NEW" ]; then echo "$NEW" > "$FAN_DEV"; fi
+                    if [ "$(cat $FAN_DEV)" != "$NEW" ]; then echo "$NEW" > "$FAN_DEV"; fi
                     sleep 5
                 done
             '
@@ -185,7 +168,7 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPi-R4-v25.12-Final-Inject
+        name: BPi-R4-v25.12-Final-Fix2
         path: |
           openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
           openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
