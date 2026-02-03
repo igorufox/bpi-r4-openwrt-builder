@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (v25.12 + Correct Patch)
+name: Build OpenWrt BPi-R4 (Final Fix - Direct Injection)
 
 on:
   workflow_dispatch:
@@ -51,39 +51,45 @@ jobs:
         echo "CONFIG_PACKAGE_ethtool-full=y" >> .config 
         make defconfig
 
-    - name: Create ODI SFP Patch
+    - name: Inject ODI Support Directly
       working-directory: ./openwrt
       run: |
-        # Автопоиск папки (для v25.12 это будет patches-6.12)
-        PATCH_DIR=$(find target/linux/mediatek -maxdepth 1 -type d -name "patches-6.*" | sort -r | head -n 1)
-        if [ -z "$PATCH_DIR" ]; then echo "ERROR: Patch dir not found!"; exit 1; fi
+        # 1. Распаковываем исходники ядра (prepare)
+        echo "Unpacking kernel..."
+        make target/linux/prepare V=s
         
-        echo "Creating patch in $PATCH_DIR"
-
-        # ПРАВИЛЬНЫЙ ПАТЧ ДЛЯ ЯДРА 6.12
-        # Мы учитываем, что ALCATELLUCENT идет первым в списке.
-        cat << 'EOF' > "$PATCH_DIR/999-sfp-odi-quirk.patch"
-        --- a/drivers/net/phy/sfp.c
-        +++ b/drivers/net/phy/sfp.c
-        @@ -448,6 +448,9 @@
-         static const struct sfp_quirk sfp_quirk_oem_modes[] = {
-         	{ "ALCATELLUCENT", "3FE46541AA", sfp_quirk_2500basex },
-         	{ "HUAWEI", "MA5671A", sfp_quirk_2500basex },
-        +	{ "ODI", "DFP-34X-2C2", sfp_quirk_2500basex },
-        +	{ "ODI", "DFP-34X-2C3", sfp_quirk_2500basex },
-         	{ "NOKIA", "3FE46541AA", sfp_quirk_2500basex },
-         	{ "UBNT", "UF-INSTANT", sfp_quirk_ubnt_uf_instant },
-         };
-        EOF
+        # 2. Находим файл драйвера sfp.c
+        SFP_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/drivers/net/phy/ -name "sfp.c" -print -quit)
+        
+        if [ -z "$SFP_FILE" ]; then
+          echo "CRITICAL ERROR: sfp.c not found!"
+          exit 1
+        fi
+        
+        echo "Modifying driver: $SFP_FILE"
+        
+        # 3. Вставляем поддержку ODI.
+        # Ищем строку с HUAWEI и добавляем после неё наши ODI.
+        # Это надежнее патча, так как игнорирует проблемы с пробелами в YAML.
+        
+        sed -i '/"HUAWEI", "MA5671A"/a \
+        \	{ "ODI", "DFP-34X-2C2", sfp_quirk_2500basex },\
+        \	{ "ODI", "DFP-34X-2C3", sfp_quirk_2500basex },' "$SFP_FILE"
+        
+        # Проверяем результат (выводим 5 строк вокруг HUAWEI)
+        echo "Checking modification:"
+        grep -C 3 "ODI" "$SFP_FILE" || echo "WARNING: Injection might have failed, please check logs."
 
     - name: Apply Fan DTS (5 Steps)
       working-directory: ./openwrt
       run: |
-        make target/linux/prepare V=s
+        # DTS файл лежит в распакованном ядре
         DTS_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
+        
         if [ -z "$DTS_FILE" ]; then echo "ERROR: DTS not found!"; exit 1; fi
         
         cat << 'EOF' >> "$DTS_FILE"
+        
         /* --- SFP FAN DEFINITION --- */
         &pio {
             pwm6_pins: pwm6-pins {
@@ -93,6 +99,7 @@ jobs:
                 };
             };
         };
+
         / {
             sfp_fan: sfp-fan {
                 compatible = "pwm-fan";
@@ -109,6 +116,7 @@ jobs:
       working-directory: ./openwrt
       run: |
         mkdir -p package/base-files/files/etc/init.d/
+        
         cat << 'EOF' > package/base-files/files/etc/init.d/fan_control
         #!/bin/sh /etc/rc.common
         START=99
@@ -118,6 +126,7 @@ jobs:
             procd_open_instance
             procd_set_param command /bin/sh -c '
                 FAN_DEV="/sys/class/thermal/cooling_device1/cur_state"
+                # Проверка: если device1 - не вентилятор (нет 4 скоростей), ищем правильный
                 if [ "$(cat /sys/class/thermal/cooling_device1/max_state)" != "4" ]; then
                     for d in /sys/class/thermal/cooling_device*; do
                         if [ "$(cat $d/max_state)" = "4" ]; then FAN_DEV="$d/cur_state"; break; fi
@@ -126,7 +135,7 @@ jobs:
 
                 while true; do
                     MAX_TEMP=0
-                    # Check WiFi temps
+                    # WiFi Temp
                     for hw in /sys/class/hwmon/hwmon*; do
                         NAME=$(cat "$hw/name" 2>/dev/null)
                         if echo "$NAME" | grep -q "mt7996"; then
@@ -138,7 +147,7 @@ jobs:
                         fi
                     done
                     
-                    # Fallback to CPU
+                    # CPU Fallback
                     if [ "$MAX_TEMP" -eq 0 ]; then
                         CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
                         MAX_TEMP=$((CPU_T / 1000))
@@ -176,7 +185,7 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPi-R4-v25.12-Final-Patch
+        name: BPi-R4-v25.12-Final-Inject
         path: |
           openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
           openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
