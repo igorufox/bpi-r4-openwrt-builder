@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (v25.12-rc4 + ODI + Fan)
+name: Build OpenWrt BPi-R4 (v25.12 + Correct Patch)
 
 on:
   workflow_dispatch:
@@ -34,9 +34,7 @@ jobs:
 
     - name: Clone OpenWrt Source (Tag v25.12.0-rc4)
       run: |
-        # СТРОГО v25.12.0-rc4
         git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
-        
         cd openwrt
         sed -i '/src-git video/d' feeds.conf.default
         ./scripts/feeds update -a
@@ -53,26 +51,29 @@ jobs:
         echo "CONFIG_PACKAGE_ethtool-full=y" >> .config 
         make defconfig
 
-    - name: Apply ODI SFP Patch (Only ODI)
+    - name: Create ODI SFP Patch
       working-directory: ./openwrt
       run: |
+        # Автопоиск папки (для v25.12 это будет patches-6.12)
         PATCH_DIR=$(find target/linux/mediatek -maxdepth 1 -type d -name "patches-6.*" | sort -r | head -n 1)
         if [ -z "$PATCH_DIR" ]; then echo "ERROR: Patch dir not found!"; exit 1; fi
         
-        # Патчим ТОЛЬКО ODI (2C2 и 2C3)
+        echo "Creating patch in $PATCH_DIR"
+
+        # ПРАВИЛЬНЫЙ ПАТЧ ДЛЯ ЯДРА 6.12
+        # Мы учитываем, что ALCATELLUCENT идет первым в списке.
         cat << 'EOF' > "$PATCH_DIR/999-sfp-odi-quirk.patch"
         --- a/drivers/net/phy/sfp.c
         +++ b/drivers/net/phy/sfp.c
-        @@ -450,6 +450,9 @@ static const struct sfp_quirk sfp_quirk_oem_modes[] = {
-         	{ "HUAWEI", "MA5671A", sfp_quirk_2500basex },
+        @@ -448,6 +448,9 @@
+         static const struct sfp_quirk sfp_quirk_oem_modes[] = {
          	{ "ALCATELLUCENT", "3FE46541AA", sfp_quirk_2500basex },
-         	{ "NOKIA", "3FE46541AA", sfp_quirk_2500basex },
-        +	// ODI Realtek Sticks Only
+         	{ "HUAWEI", "MA5671A", sfp_quirk_2500basex },
         +	{ "ODI", "DFP-34X-2C2", sfp_quirk_2500basex },
         +	{ "ODI", "DFP-34X-2C3", sfp_quirk_2500basex },
+         	{ "NOKIA", "3FE46541AA", sfp_quirk_2500basex },
+         	{ "UBNT", "UF-INSTANT", sfp_quirk_ubnt_uf_instant },
          };
-         
-         static const struct sfp_quirk *sfp_lookup_quirk(const struct sfp_eeprom_id *id)
         EOF
 
     - name: Apply Fan DTS (5 Steps)
@@ -117,7 +118,6 @@ jobs:
             procd_open_instance
             procd_set_param command /bin/sh -c '
                 FAN_DEV="/sys/class/thermal/cooling_device1/cur_state"
-                # Проверка, что device1 - это вентилятор (4 скорости: 0..4)
                 if [ "$(cat /sys/class/thermal/cooling_device1/max_state)" != "4" ]; then
                     for d in /sys/class/thermal/cooling_device*; do
                         if [ "$(cat $d/max_state)" = "4" ]; then FAN_DEV="$d/cur_state"; break; fi
@@ -126,7 +126,7 @@ jobs:
 
                 while true; do
                     MAX_TEMP=0
-                    # Температура Wi-Fi
+                    # Check WiFi temps
                     for hw in /sys/class/hwmon/hwmon*; do
                         NAME=$(cat "$hw/name" 2>/dev/null)
                         if echo "$NAME" | grep -q "mt7996"; then
@@ -138,13 +138,13 @@ jobs:
                         fi
                     done
                     
-                    # Резерв CPU
+                    # Fallback to CPU
                     if [ "$MAX_TEMP" -eq 0 ]; then
                         CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
                         MAX_TEMP=$((CPU_T / 1000))
                     fi
 
-                    # Логика 5 скоростей (0, 75, 125, 180, 255)
+                    # Logic: 0, 75(1), 125(2), 180(3), 255(4)
                     if [ "$MAX_TEMP" -ge 68 ]; then NEW=4
                     elif [ "$MAX_TEMP" -ge 60 ]; then NEW=3
                     elif [ "$MAX_TEMP" -ge 52 ]; then NEW=2
@@ -176,7 +176,7 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPi-R4-v25.12-rc4-Final
+        name: BPi-R4-v25.12-Final-Patch
         path: |
           openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
           openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
