@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (Final Fix - Huawei Anchor)
+name: Build OpenWrt BPi-R4 (Final: Upload ALL)
 
 on:
   workflow_dispatch:
@@ -37,10 +37,11 @@ jobs:
         git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
         cd openwrt
         
-        # Clean feeds
+        # Чистим фиды
         sed -i '/src-git video/d' feeds.conf.default
         sed -i '/src-git telephony/d' feeds.conf.default
         
+        # Игнорируем ошибки фидов
         ./scripts/feeds update -a || true
         ./scripts/feeds install -a || true
 
@@ -63,20 +64,12 @@ jobs:
         SFP_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/drivers/net/phy/ -name "sfp.c" -print -quit)
         if [ -z "$SFP_FILE" ]; then echo "ERROR: sfp.c missing"; exit 1; fi
         
-        echo "Target file: $SFP_FILE"
+        echo "Injecting into: $SFP_FILE"
         
-        # 1. Сначала покажем, как выглядит место, куда мы хотим вклиниться (для отладки)
-        echo "--- Content BEFORE ---"
-        grep -C 2 "MA5671A" "$SFP_FILE" || echo "WARNING: Anchor string not found!"
-        
-        # 2. Вставка. Ищем строку с HUAWEI и заменяем её на "Наши строки + Перенос + Строка с HUAWEI"
-        # Используем & чтобы вернуть найденную строку на место (но уже после наших).
-        # Экранируем кавычки.
-        
+        # Вставляем наши ODI перед HUAWEI MA5671A
         sed -i 's/SFP_QUIRK("HUAWEI", "MA5671A"/SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),\n\tSFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),\n\t&/' "$SFP_FILE"
         
-        # 3. Проверка
-        echo "--- Content AFTER ---"
+        # Проверка
         grep -C 3 "ODI" "$SFP_FILE"
 
     - name: Apply Fan DTS (5 Steps)
@@ -143,3 +136,44 @@ jobs:
                     
                     if [ "$MAX_TEMP" -eq 0 ]; then
                         CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
+                        MAX_TEMP=$((CPU_T / 1000))
+                    fi
+
+                    if [ "$MAX_TEMP" -ge 68 ]; then NEW=4
+                    elif [ "$MAX_TEMP" -ge 60 ]; then NEW=3
+                    elif [ "$MAX_TEMP" -ge 52 ]; then NEW=2
+                    elif [ "$MAX_TEMP" -ge 45 ]; then NEW=1
+                    elif [ "$MAX_TEMP" -le 40 ]; then NEW=0
+                    else CUR=$(cat "$FAN_DEV"); if [ "$CUR" -gt 0 ]; then NEW="$CUR"; else NEW=0; fi
+                    fi
+
+                    if [ "$(cat $FAN_DEV)" != "$NEW" ]; then echo "$NEW" > "$FAN_DEV"; fi
+                    sleep 5
+                done
+            '
+            procd_set_param respawn
+            procd_close_instance
+        }
+        EOF
+        chmod +x package/base-files/files/etc/init.d/fan_control
+
+    - name: Download Sources
+      working-directory: ./openwrt
+      run: make download -j8
+
+    - name: Compile Firmware
+      working-directory: ./openwrt
+      run: |
+        make -j$(nproc) || make -j1 V=s
+
+    - name: List Output Files (DEBUG)
+      working-directory: ./openwrt
+      run: |
+        echo "=== CONTENT OF BIN DIRECTORY ==="
+        find bin -type f
+
+    - name: Upload Everything
+      uses: actions/upload-artifact@v4
+      with:
+        name: BPi-R4-Full-Package
+        path: openwrt/bin/targets/mediatek/filogic/*
