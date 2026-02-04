@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (Final: Upload ALL)
+name: Build OpenWrt BPi-R4 (Final Clean)
 
 on:
   workflow_dispatch:
@@ -37,11 +37,11 @@ jobs:
         git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
         cd openwrt
         
-        # Чистим фиды
+        # Удаляем проблемные фиды
         sed -i '/src-git video/d' feeds.conf.default
         sed -i '/src-git telephony/d' feeds.conf.default
         
-        # Игнорируем ошибки фидов
+        # Обновляем (игнорируем ошибки)
         ./scripts/feeds update -a || true
         ./scripts/feeds install -a || true
 
@@ -56,20 +56,31 @@ jobs:
         echo "CONFIG_PACKAGE_ethtool-full=y" >> .config 
         make defconfig
 
-    - name: Inject ODI Support (Huawei Anchor)
+    - name: Inject ODI Support (Safe Script Method)
       working-directory: ./openwrt
       run: |
+        # 1. Распаковка
         make target/linux/prepare V=s
         
+        # 2. Поиск файла
         SFP_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/drivers/net/phy/ -name "sfp.c" -print -quit)
         if [ -z "$SFP_FILE" ]; then echo "ERROR: sfp.c missing"; exit 1; fi
         
-        echo "Injecting into: $SFP_FILE"
+        echo "Found driver: $SFP_FILE"
         
-        # Вставляем наши ODI перед HUAWEI MA5671A
-        sed -i 's/SFP_QUIRK("HUAWEI", "MA5671A"/SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),\n\tSFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),\n\t&/' "$SFP_FILE"
+        # 3. Создаем файл команд для sed (чтобы не ломать YAML)
+        # Мы ищем строку с HUAWEI и ВСТАВЛЯЕМ (команда i) перед ней наши строки.
+        # \ перед переносом строки нужен для sed.
+        cat << 'EOF' > odi_patch.sed
+        /SFP_QUIRK("HUAWEI", "MA5671A"/i \
+        	SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),\
+        	SFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),
+        EOF
         
-        # Проверка
+        # 4. Применяем
+        sed -i -f odi_patch.sed "$SFP_FILE"
+        
+        # 5. Проверяем
         grep -C 3 "ODI" "$SFP_FILE"
 
     - name: Apply Fan DTS (5 Steps)
@@ -166,7 +177,7 @@ jobs:
       run: |
         make -j$(nproc) || make -j1 V=s
 
-    - name: List Output Files (DEBUG)
+    - name: List Output Files
       working-directory: ./openwrt
       run: |
         echo "=== CONTENT OF BIN DIRECTORY ==="
