@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (Final Fix 4.0 - File Injection)
+name: Build OpenWrt BPi-R4 (Final Fix - Huawei Anchor)
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ jobs:
         git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
         cd openwrt
         
-        # Чистим фиды и разрешаем ошибки (|| true)
+        # Clean feeds
         sed -i '/src-git video/d' feeds.conf.default
         sed -i '/src-git telephony/d' feeds.conf.default
         
@@ -55,30 +55,29 @@ jobs:
         echo "CONFIG_PACKAGE_ethtool-full=y" >> .config 
         make defconfig
 
-    - name: Inject ODI Support (Fail-Safe Method)
+    - name: Inject ODI Support (Huawei Anchor)
       working-directory: ./openwrt
       run: |
-        # 1. Распаковка ядра
         make target/linux/prepare V=s
         
-        # 2. Поиск файла sfp.c
         SFP_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/drivers/net/phy/ -name "sfp.c" -print -quit)
         if [ -z "$SFP_FILE" ]; then echo "ERROR: sfp.c missing"; exit 1; fi
         
-        echo "Found driver: $SFP_FILE"
+        echo "Target file: $SFP_FILE"
         
-        # 3. Создаем временный файл с нашим кодом (используем C-макросы ядра 6.12)
-        cat << 'EOF' > odi_snippet.inc
-        	SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),
-        	SFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),
-        EOF
+        # 1. Сначала покажем, как выглядит место, куда мы хотим вклиниться (для отладки)
+        echo "--- Content BEFORE ---"
+        grep -C 2 "MA5671A" "$SFP_FILE" || echo "WARNING: Anchor string not found!"
         
-        # 4. Вставляем содержимое файла odi_snippet.inc ПОСЛЕ строки "sfp_quirk_oem_modes[] = {"
-        # Команда 'r' (read file) в sed работает идеально и не требует экранирования.
-        sed -i '/sfp_quirk_oem_modes\[\] = {/r odi_snippet.inc' "$SFP_FILE"
+        # 2. Вставка. Ищем строку с HUAWEI и заменяем её на "Наши строки + Перенос + Строка с HUAWEI"
+        # Используем & чтобы вернуть найденную строку на место (но уже после наших).
+        # Экранируем кавычки.
         
-        echo "Injection done. Checking result:"
-        grep -A 5 "sfp_quirk_oem_modes" "$SFP_FILE"
+        sed -i 's/SFP_QUIRK("HUAWEI", "MA5671A"/SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),\n\tSFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),\n\t&/' "$SFP_FILE"
+        
+        # 3. Проверка
+        echo "--- Content AFTER ---"
+        grep -C 3 "ODI" "$SFP_FILE"
 
     - name: Apply Fan DTS (5 Steps)
       working-directory: ./openwrt
@@ -144,40 +143,3 @@ jobs:
                     
                     if [ "$MAX_TEMP" -eq 0 ]; then
                         CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
-                        MAX_TEMP=$((CPU_T / 1000))
-                    fi
-
-                    if [ "$MAX_TEMP" -ge 68 ]; then NEW=4
-                    elif [ "$MAX_TEMP" -ge 60 ]; then NEW=3
-                    elif [ "$MAX_TEMP" -ge 52 ]; then NEW=2
-                    elif [ "$MAX_TEMP" -ge 45 ]; then NEW=1
-                    elif [ "$MAX_TEMP" -le 40 ]; then NEW=0
-                    else CUR=$(cat "$FAN_DEV"); if [ "$CUR" -gt 0 ]; then NEW="$CUR"; else NEW=0; fi
-                    fi
-
-                    if [ "$(cat $FAN_DEV)" != "$NEW" ]; then echo "$NEW" > "$FAN_DEV"; fi
-                    sleep 5
-                done
-            '
-            procd_set_param respawn
-            procd_close_instance
-        }
-        EOF
-        chmod +x package/base-files/files/etc/init.d/fan_control
-
-    - name: Download Sources
-      working-directory: ./openwrt
-      run: make download -j8
-
-    - name: Compile Firmware
-      working-directory: ./openwrt
-      run: |
-        make -j$(nproc) || make -j1 V=s
-
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: BPi-R4-v25.12-Final-FileInject
-        path: |
-          openwrt/bin/targets/mediatek/filogic/*sdcard.img.gz
-          openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
