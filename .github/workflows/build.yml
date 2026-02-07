@@ -1,21 +1,21 @@
-name: Build OpenWrt BPi-R4 (Final Clean)
+name: Combo Build (Source Patch + ImageBuilder)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
+
+env:
+  OPENWRT_TAG: v25.12.0-rc4
+  IB_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic/openwrt-imagebuilder-25.12.0-rc4-mediatek-filogic.Linux-x86_64.tar.zst
+  PROFILE: bananapi_bpi-r4
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    
     steps:
     - name: Checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
-    - name: Free Disk Space (Ubuntu)
+    - name: Free Disk Space
       uses: jlumbroso/free-disk-space@main
       with:
         tool-cache: true
@@ -29,82 +29,45 @@ jobs:
       run: |
         sudo apt update
         sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-        gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
-        file wget
+        gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget time zstd
 
-    - name: Clone OpenWrt Source (Tag v25.12.0-rc4)
-      run: |
-        git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
-        cd openwrt
-        
-        # Удаляем проблемные фиды
-        sed -i '/src-git video/d' feeds.conf.default
-        sed -i '/src-git telephony/d' feeds.conf.default
-        
-        # Обновляем (игнорируем ошибки)
-        ./scripts/feeds update -a || true
-        ./scripts/feeds install -a || true
+    # --- ЭТАП 1: СБОРКА DTB ИЗ ИСХОДНИКОВ ---
+    - name: Clone OpenWrt Source
+      run: git clone --depth 1 --branch ${{ env.OPENWRT_TAG }} https://github.com/openwrt/openwrt.git openwrt
 
-    - name: Configure Target (BPi-R4)
+    - name: Update Feeds
       working-directory: ./openwrt
       run: |
-        echo "CONFIG_TARGET_mediatek=y" > .config
-        echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
-        echo "CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y" >> .config
-        echo "CONFIG_PACKAGE_luci=y" >> .config
-        echo "CONFIG_PACKAGE_kmod-pwm-fan=y" >> .config
-        echo "CONFIG_PACKAGE_ethtool-full=y" >> .config 
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Configure Target
+      working-directory: ./openwrt
+      run: |
+        cat > .config <<EOF
+        CONFIG_TARGET_mediatek=y
+        CONFIG_TARGET_mediatek_filogic=y
+        CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y
+        EOF
         make defconfig
 
-    - name: Inject ODI Support (Safe Script Method)
+    - name: 🔥 APPLY FAN PATCH (To Source)
       working-directory: ./openwrt
       run: |
-        # 1. Распаковка
-        make target/linux/prepare V=s
+        DTS_FILE="target/linux/mediatek/dts/mt7988a-bananapi-bpi-r4.dts"
         
-        # 2. Поиск файла
-        SFP_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/drivers/net/phy/ -name "sfp.c" -print -quit)
-        if [ -z "$SFP_FILE" ]; then echo "ERROR: sfp.c missing"; exit 1; fi
-        
-        echo "Found driver: $SFP_FILE"
-        
-        # 3. Создаем файл команд для sed (чтобы не ломать YAML)
-        # Мы ищем строку с HUAWEI и ВСТАВЛЯЕМ (команда i) перед ней наши строки.
-        # \ перед переносом строки нужен для sed.
-        cat << 'EOF' > odi_patch.sed
-        /SFP_QUIRK("HUAWEI", "MA5671A"/i \
-        	SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),\
-        	SFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),
-        EOF
-        
-        # 4. Применяем
-        sed -i -f odi_patch.sed "$SFP_FILE"
-        
-        # 5. Проверяем
-        grep -C 3 "ODI" "$SFP_FILE"
-
-    - name: Apply Fan DTS (5 Steps)
-      working-directory: ./openwrt
-      run: |
-        DTS_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
-        if [ -z "$DTS_FILE" ]; then echo "ERROR: DTS not found!"; exit 1; fi
-        
-        cat << 'EOF' >> "$DTS_FILE"
-        
-        /* --- SFP FAN DEFINITION --- */
+        cat << 'EOF' >> $DTS_FILE
+        /* --- USER FAN PATCH --- */
+        &pwm { status = "okay"; };
         &pio {
             pwm6_pins: pwm6-pins {
-                mux {
-                    function = "pwm";
-                    groups = "pwm6_0";
-                };
+                mux { function = "pwm"; groups = "pwm6_0"; };
             };
         };
-
         / {
             sfp_fan: sfp-fan {
                 compatible = "pwm-fan";
-                pwms = <&pwm 6 50000>;
+                pwms = <&pwm 6 50000 0>;
                 pinctrl-names = "default";
                 pinctrl-0 = <&pwm6_pins>;
                 cooling-levels = <0 75 125 180 255>;
@@ -113,78 +76,60 @@ jobs:
         };
         EOF
 
-    - name: Create Fan Control Script
+    - name: Compile Device Tree (DTB Only)
       working-directory: ./openwrt
       run: |
-        mkdir -p package/base-files/files/etc/init.d/
-        cat << 'EOF' > package/base-files/files/etc/init.d/fan_control
-        #!/bin/sh /etc/rc.common
-        START=99
-        USE_PROCD=1
+        # Собираем только target (ядро и dtb), это быстрее полной сборки
+        make target/linux/compile -j$(nproc) || make target/linux/compile -j1 V=s
+
+    - name: Locate Golden DTB
+      working-directory: ./openwrt
+      run: |
+        # Ищем и сохраняем наш файл
+        DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
+        cp "$DTB" ../golden_patched.dtb
+        echo "✅ Golden DTB extracted: ../golden_patched.dtb"
+
+    # --- ЭТАП 2: СБОРКА ПРОШИВКИ ЧЕРЕЗ IMAGEBUILDER ---
+    - name: Setup ImageBuilder
+      run: |
+        wget ${{ env.IB_URL }} -O ib.tar.zst
+        tar --zstd -xvf ib.tar.zst
+        mv openwrt-imagebuilder-* imagebuilder
+
+    - name: Prepare ImageBuilder Folders
+      working-directory: ./imagebuilder
+      run: |
+        # Запускаем, чтобы распаковать ядро, и сразу гасим (нам нужны только папки)
+        make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
+
+    - name: 💉 INJECT GOLDEN DTB
+      working-directory: ./imagebuilder
+      run: |
+        # Находим, куда ImageBuilder положил стоковый DTB
+        TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         
-        start_service() {
-            procd_open_instance
-            procd_set_param command /bin/sh -c '
-                FAN_DEV="/sys/class/thermal/cooling_device1/cur_state"
-                if [ "$(cat /sys/class/thermal/cooling_device1/max_state)" != "4" ]; then
-                    for d in /sys/class/thermal/cooling_device*; do
-                        if [ "$(cat $d/max_state)" = "4" ]; then FAN_DEV="$d/cur_state"; break; fi
-                    done
-                fi
+        if [ -z "$TARGET_DTB" ]; then
+          echo "❌ Error: ImageBuilder didn't unpack yet. Trying forced unpack..."
+          # Если не нашел - пробуем еще раз (иногда make image не успевает распаковать)
+          make target/linux/prepare || true
+          TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
+        fi
 
-                while true; do
-                    MAX_TEMP=0
-                    for hw in /sys/class/hwmon/hwmon*; do
-                        NAME=$(cat "$hw/name" 2>/dev/null)
-                        if echo "$NAME" | grep -q "mt7996"; then
-                            for t in "$hw"/temp*_input; do
-                                [ -f "$t" ] || continue
-                                TEMP=$(cat "$t"); TEMP=$((TEMP / 1000))
-                                if [ "$TEMP" -gt "$MAX_TEMP" ]; then MAX_TEMP=$TEMP; fi
-                            done
-                        fi
-                    done
-                    
-                    if [ "$MAX_TEMP" -eq 0 ]; then
-                        CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
-                        MAX_TEMP=$((CPU_T / 1000))
-                    fi
+        echo "🔄 Replacing $TARGET_DTB with ../golden_patched.dtb"
+        cp ../golden_patched.dtb "$TARGET_DTB"
 
-                    if [ "$MAX_TEMP" -ge 68 ]; then NEW=4
-                    elif [ "$MAX_TEMP" -ge 60 ]; then NEW=3
-                    elif [ "$MAX_TEMP" -ge 52 ]; then NEW=2
-                    elif [ "$MAX_TEMP" -ge 45 ]; then NEW=1
-                    elif [ "$MAX_TEMP" -le 40 ]; then NEW=0
-                    else CUR=$(cat "$FAN_DEV"); if [ "$CUR" -gt 0 ]; then NEW="$CUR"; else NEW=0; fi
-                    fi
-
-                    if [ "$(cat $FAN_DEV)" != "$NEW" ]; then echo "$NEW" > "$FAN_DEV"; fi
-                    sleep 5
-                done
-            '
-            procd_set_param respawn
-            procd_close_instance
-        }
-        EOF
-        chmod +x package/base-files/files/etc/init.d/fan_control
-
-    - name: Download Sources
-      working-directory: ./openwrt
-      run: make download -j8
-
-    - name: Compile Firmware
-      working-directory: ./openwrt
+    - name: Build Final Firmware
+      working-directory: ./imagebuilder
       run: |
-        make -j$(nproc) || make -j1 V=s
+        # Собираем! ImageBuilder возьмет наш подмененный файл
+        make image PROFILE="${{ env.PROFILE }}" \
+        PACKAGES="kmod-hwmon-pwmfan kmod-nvme kmod-fs-ext4 kmod-usb-storage kmod-usb-storage-uas block-mount e2fsprogs fdisk ethtool luci-ssl-nginx nano htop"
 
-    - name: List Output Files
-      working-directory: ./openwrt
-      run: |
-        echo "=== CONTENT OF BIN DIRECTORY ==="
-        find bin -type f
-
-    - name: Upload Everything
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPi-R4-Full-Package
-        path: openwrt/bin/targets/mediatek/filogic/*
+        name: BPi-R4-Hybrid-Firmware
+        path: |
+          imagebuilder/bin/targets/mediatek/filogic/*sysupgrade.itb
+          imagebuilder/bin/targets/mediatek/filogic/*sdcard.img.gz
