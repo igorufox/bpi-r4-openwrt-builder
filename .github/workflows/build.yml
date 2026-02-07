@@ -4,14 +4,13 @@ on:
   workflow_dispatch:
 
 env:
-  # Версия OpenWrt
+  # Версия OpenWrt и цель
   RELEASE: 25.12.0-rc4
   TARGET: mediatek
   SUBTARGET: filogic
   PROFILE: bananapi_bpi-r4
-  # Ссылки
-  SDK_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic/openwrt-sdk-25.12.0-rc4-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst
-  IB_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic/openwrt-imagebuilder-25.12.0-rc4-mediatek-filogic.Linux-x86_64.tar.zst
+  # Ссылка на папку загрузок (файлы найдем сами)
+  BASE_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic
 
 jobs:
   build:
@@ -27,20 +26,38 @@ jobs:
         gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget zstd
 
     # --- ЭТАП 1: ПОЛУЧЕНИЕ ЗОЛОТОГО DTB ЧЕРЕЗ SDK ---
-    - name: Download & Setup SDK
+    - name: Download & Setup SDK (Auto-Detect)
       run: |
-        wget ${{ env.SDK_URL }} -O sdk.tar.zst
+        # 1. Скачиваем контрольную сумму, чтобы узнать точное имя файла SDK
+        echo "🔎 Searching for SDK in ${{ env.BASE_URL }}..."
+        wget "${{ env.BASE_URL }}/sha256sums" -O sha256sums
+        
+        # 2. Ищем имя файла SDK (обычно содержит 'openwrt-sdk' и заканчивается на '.tar.zst')
+        SDK_FILE=$(grep -o "openwrt-sdk-.*\.tar\.zst" sha256sums | head -n 1)
+        
+        if [ -z "$SDK_FILE" ]; then
+          echo "❌ ERROR: Could not find SDK filename in sha256sums!"
+          cat sha256sums
+          exit 1
+        fi
+        
+        echo "✅ Found SDK: $SDK_FILE"
+        
+        # 3. Скачиваем сам SDK
+        wget "${{ env.BASE_URL }}/$SDK_FILE" -O sdk.tar.zst
+        
+        # 4. Распаковываем
         tar --zstd -xvf sdk.tar.zst
         mv openwrt-sdk-* sdk
 
     - name: Prepare SDK
       working-directory: ./sdk
       run: |
-        # Обновляем фиды (нужно для сборки ядра)
+        # Обновляем списки пакетов (нужно для ядра)
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         
-        # Настраиваем конфиг под R4
+        # Создаем конфиг под R4
         cat > .config <<EOF
         CONFIG_TARGET_mediatek=y
         CONFIG_TARGET_mediatek_filogic=y
@@ -51,19 +68,23 @@ jobs:
     - name: Unpack Kernel Source
       working-directory: ./sdk
       run: |
-        # Эта команда скачает исходники ядра и распакует их в build_dir
-        # Компилировать пока рано, нам нужно только распаковать, чтобы пропатчить
+        # Скачиваем и распаковываем исходники ядра (но не компилируем пока)
         make target/linux/prepare
 
     - name: 🔥 APPLY FAN PATCH (To Source)
       working-directory: ./sdk
       run: |
-        # Ищем, куда SDK распаковал DTS файл
+        # Ищем распакованный файл DTS
         DTS_FILE=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" | head -n 1)
         
-        echo "Patcher: Found DTS at $DTS_FILE"
+        if [ -z "$DTS_FILE" ]; then
+          echo "❌ ERROR: DTS file not found after unpack!"
+          exit 1
+        fi
+
+        echo "✅ Patcher: Found DTS at $DTS_FILE"
         
-        # Вживляем наш код. Так как это ИСХОДНИК, тут работают метки &pwm и &pio!
+        # Дописываем настройки вентилятора в конец файла
         cat << 'EOF' >> "$DTS_FILE"
 
         /* --- USER FAN PATCH (FROM SOURCE) --- */
@@ -86,66 +107,4 @@ jobs:
                 pwms = <&pwm 6 50000 0>;
                 pinctrl-names = "default";
                 pinctrl-0 = <&pwm6_pins>;
-                cooling-levels = <0 75 125 180 255>;
-                #cooling-cells = <2>;
-            };
-        };
-        EOF
-        echo "✅ DTS Patched Successfully!"
-
-    - name: Compile DTB
-      working-directory: ./sdk
-      run: |
-        # Теперь собираем ядро. SDK использует свой встроенный gcc, поэтому ошибок не будет.
-        # -j$(nproc) ускорит процесс
-        make target/linux/compile -j$(nproc)
-
-    - name: Extract Golden DTB
-      working-directory: ./sdk
-      run: |
-        # Забираем свежий скомпилированный бинарник
-        DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
-        cp "$DTB" ../golden_patched.dtb
-        echo "✅ Extracted: ../golden_patched.dtb"
-
-    # --- ЭТАП 2: СБОРКА ПРОШИВКИ ЧЕРЕЗ IMAGEBUILDER ---
-    - name: Setup ImageBuilder
-      run: |
-        wget ${{ env.IB_URL }} -O ib.tar.zst
-        tar --zstd -xvf ib.tar.zst
-        mv openwrt-imagebuilder-* imagebuilder
-
-    - name: Prepare ImageBuilder
-      working-directory: ./imagebuilder
-      run: |
-        # Холостой прогон для создания папок
-        make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
-
-    - name: 💉 INJECT GOLDEN DTB
-      working-directory: ./imagebuilder
-      run: |
-        # Ищем стоковый файл в ImageBuilder
-        TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
-        
-        if [ -z "$TARGET_DTB" ]; then
-           # Если папки еще нет, пнем его
-           make target/linux/prepare || true
-           TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
-        fi
-
-        echo "🔄 Replacing stock DTB: $TARGET_DTB"
-        cp ../golden_patched.dtb "$TARGET_DTB"
-
-    - name: Build Final Firmware
-      working-directory: ./imagebuilder
-      run: |
-        make image PROFILE="${{ env.PROFILE }}" \
-        PACKAGES="kmod-hwmon-pwmfan kmod-nvme kmod-fs-ext4 kmod-usb-storage kmod-usb-storage-uas block-mount e2fsprogs fdisk ethtool luci-ssl-nginx nano htop"
-
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: BPi-R4-Silent-Firmware
-        path: |
-          imagebuilder/bin/targets/mediatek/filogic/*sysupgrade.itb
-          imagebuilder/bin/targets/mediatek/filogic/*sdcard.img.gz
+                cooling-levels = <0 7
