@@ -30,17 +30,18 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt update
+        # ДОБАВЛЕНЫ: libelf-dev, autopoint, gperf, texinfo, pkg-config и другие важные пакеты
         sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-        gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget zstd
+        gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget zstd \
+        autopoint gperf texinfo help2man libtool libtool-bin pkg-config libelf-dev
 
     # --- ЭТАП 1: СБОРКА DTB ИЗ ЧИСТЫХ ИСХОДНИКОВ ---
     - name: Clone OpenWrt Source
       run: git clone --depth 1 --branch v${{ env.RELEASE }} https://github.com/openwrt/openwrt.git openwrt
 
-    - name: Disable Feeds (Save time & prevent errors)
+    - name: Disable Feeds
       working-directory: ./openwrt
       run: |
-        # Очищаем фиды, чтобы не качать тысячи пакетов. Нам нужно только ядро.
         echo '' > feeds.conf.default
         ./scripts/feeds update -a
         ./scripts/feeds install -a
@@ -81,19 +82,16 @@ jobs:
         };
         EOF
 
-    - name: 🔨 Compile Toolchain (REQUIRED)
+    - name: 🔨 Compile Toolchain
       working-directory: ./openwrt
       run: |
-        # Сначала собираем инструменты хоста (sed, m4, flex)
+        # С новыми зависимостями это должно пройти успешно
         make tools/install -j$(nproc) || make tools/install -j1 V=s
-        
-        # Затем собираем кросс-компилятор (gcc). Без этого ядро не собрать.
         make toolchain/install -j$(nproc) || make toolchain/install -j1 V=s
 
     - name: Compile Device Tree (DTB)
       working-directory: ./openwrt
       run: |
-        # Теперь, когда есть компилятор, собираем ядро и DTB
         make target/linux/compile -j$(nproc) || make target/linux/compile -j1 V=s
 
     - name: Extract Golden DTB
@@ -122,12 +120,10 @@ jobs:
       working-directory: ./imagebuilder
       run: |
         TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
-        
         if [ -z "$TARGET_DTB" ]; then
            make target/linux/prepare || true
            TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         fi
-
         echo "🔄 Replacing: $TARGET_DTB"
         cp ../golden_patched.dtb "$TARGET_DTB"
 
