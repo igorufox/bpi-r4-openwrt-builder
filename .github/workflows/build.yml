@@ -1,15 +1,13 @@
-name: Stable Combo Build (Source + ImageBuilder)
+name: Stable Combo Build (Source + Toolchain + IB)
 
 on:
   workflow_dispatch:
 
 env:
-  # Настройки
   RELEASE: 25.12.0-rc4
   TARGET: mediatek
   SUBTARGET: filogic
   PROFILE: bananapi_bpi-r4
-  # Ссылка на ImageBuilder (у него стабильное имя без версии GCC)
   IB_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic/openwrt-imagebuilder-25.12.0-rc4-mediatek-filogic.Linux-x86_64.tar.zst
 
 jobs:
@@ -19,6 +17,16 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    - name: Free Disk Space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        swap-storage: true
+
     - name: Install Dependencies
       run: |
         sudo apt update
@@ -27,16 +35,12 @@ jobs:
 
     # --- ЭТАП 1: СБОРКА DTB ИЗ ЧИСТЫХ ИСХОДНИКОВ ---
     - name: Clone OpenWrt Source
-      run: |
-        # Клонируем ветку релиза (глубина 1 для скорости)
-        git clone --depth 1 --branch v${{ env.RELEASE }} https://github.com/openwrt/openwrt.git openwrt
+      run: git clone --depth 1 --branch v${{ env.RELEASE }} https://github.com/openwrt/openwrt.git openwrt
 
-    - name: Disable Feeds (Crucial Step)
+    - name: Disable Feeds (Save time & prevent errors)
       working-directory: ./openwrt
       run: |
-        # ВАЖНО: Мы очищаем feeds.conf. Нам НЕ нужны пакеты (nginx, asterisk и т.д.)
-        # Нам нужно только голое ядро для сборки DTB.
-        # Это предотвращает ошибки "recursive dependency" и ускоряет процесс.
+        # Очищаем фиды, чтобы не качать тысячи пакетов. Нам нужно только ядро.
         echo '' > feeds.conf.default
         ./scripts/feeds update -a
         ./scripts/feeds install -a
@@ -44,7 +48,6 @@ jobs:
     - name: Configure Target
       working-directory: ./openwrt
       run: |
-        # Настраиваем только целевую платформу
         cat > .config <<EOF
         CONFIG_TARGET_mediatek=y
         CONFIG_TARGET_mediatek_filogic=y
@@ -56,26 +59,16 @@ jobs:
       working-directory: ./openwrt
       run: |
         DTS_FILE="target/linux/mediatek/dts/mt7988a-bananapi-bpi-r4.dts"
-        
         echo "Patching $DTS_FILE ..."
         
-        # Патчим исходник. Здесь можно использовать красивые имена &pwm!
         cat << 'EOF' >> $DTS_FILE
-
         /* --- USER FAN PATCH (SOURCE) --- */
-        &pwm {
-            status = "okay";
-        };
-
+        &pwm { status = "okay"; };
         &pio {
             pwm6_pins: pwm6-pins {
-                mux {
-                    function = "pwm";
-                    groups = "pwm6_0";
-                };
+                mux { function = "pwm"; groups = "pwm6_0"; };
             };
         };
-
         / {
             sfp_fan: sfp-fan {
                 compatible = "pwm-fan";
@@ -86,28 +79,31 @@ jobs:
                 #cooling-cells = <2>;
             };
         };
-        /* --- END PATCH --- */
         EOF
+
+    - name: 🔨 Compile Toolchain (REQUIRED)
+      working-directory: ./openwrt
+      run: |
+        # Сначала собираем инструменты хоста (sed, m4, flex)
+        make tools/install -j$(nproc) || make tools/install -j1 V=s
+        
+        # Затем собираем кросс-компилятор (gcc). Без этого ядро не собрать.
+        make toolchain/install -j$(nproc) || make toolchain/install -j1 V=s
 
     - name: Compile Device Tree (DTB)
       working-directory: ./openwrt
       run: |
-        # Собираем только target/linux.
-        # Это автоматически соберет тулчейн (займет 20-30 мин) и ядро.
-        # Пакеты собираться не будут, что нам и нужно.
+        # Теперь, когда есть компилятор, собираем ядро и DTB
         make target/linux/compile -j$(nproc) || make target/linux/compile -j1 V=s
 
     - name: Extract Golden DTB
       working-directory: ./openwrt
       run: |
-        # Ищем результат сборки
         DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
-        
         if [ -z "$DTB" ]; then
            echo "❌ ERROR: DTB not built!"
            exit 1
         fi
-        
         cp "$DTB" ../golden_patched.dtb
         echo "✅ SUCCESS: Extracted $DTB"
 
@@ -120,18 +116,14 @@ jobs:
 
     - name: Prepare ImageBuilder
       working-directory: ./imagebuilder
-      run: |
-        # Прогрев
-        make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
+      run: make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
 
     - name: 💉 INJECT GOLDEN DTB
       working-directory: ./imagebuilder
       run: |
-        # Ищем куда ImageBuilder положил стоковый файл
         TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         
         if [ -z "$TARGET_DTB" ]; then
-           # Принудительная распаковка если не найден
            make target/linux/prepare || true
            TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         fi
