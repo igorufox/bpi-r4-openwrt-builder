@@ -1,14 +1,12 @@
-name: SDK Build (No Feeds - Pure Kernel)
+name: BPi-R4 Fixed SDK Build
 
 on:
   workflow_dispatch:
 
 env:
   RELEASE: 25.12.0-rc4
-  TARGET: mediatek
-  SUBTARGET: filogic
-  PROFILE: bananapi_bpi-r4
   BASE_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic
+  PROFILE: bananapi_bpi-r4
 
 jobs:
   build:
@@ -42,15 +40,20 @@ jobs:
         tar --zstd -xvf sdk.tar.zst
         mv openwrt-sdk-* sdk
 
-    # === 2. ПОДГОТОВКА (БЕЗ ФИДОВ) ===
+    # === 2. ПОДГОТОВКА (ХАК ДЛЯ NGINX) ===
     - name: Prepare Kernel Source
       working-directory: ./sdk
       run: |
-        # ВАЖНО: Удаляем источники пакетов. Нам нужен ТОЛЬКО компилятор и ядро.
-        # Это лечит ошибку "recursive dependency" в Nginx.
-        echo '' > feeds.conf.default
+        # 1. Обновляем и ставим ВСЕ фиды (нужно для зависимостей ядра)
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
         
-        # Создаем конфиг
+        # 2. УДАЛЯЕМ NGINX, чтобы не было ошибки рекурсии (Recursive dependency)
+        # Мы все равно будем ставить готовый nginx через ImageBuilder, исходники нам не нужны
+        rm -rf feeds/packages/net/nginx
+        rm -rf package/feeds/packages/nginx
+        
+        # 3. Теперь конфиг соберется без ошибок
         cat > .config <<EOF
         CONFIG_TARGET_mediatek=y
         CONFIG_TARGET_mediatek_filogic=y
@@ -58,22 +61,16 @@ jobs:
         EOF
         make defconfig
         
-        # Распаковываем ядро
+        # 4. Распаковываем ядро
         make target/linux/prepare
 
-    # === 3. ПАТЧ ВЕНТИЛЯТОРА ===
-    - name: 🔥 APPLY FAN PATCH
+    # === 3. ПАТЧ ВЕНТИЛЯТОР (РАБОЧИЙ) ===
+    - name: Apply Fan Patch
       working-directory: ./sdk
       run: |
         DTS_FILE=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" | head -n 1)
         
-        if [ -z "$DTS_FILE" ]; then
-           echo "❌ ERROR: DTS file not found!"
-           exit 1
-        fi
-
-        echo "✅ Patching $DTS_FILE ..."
-        
+        echo "Patching $DTS_FILE..."
         cat << 'EOF' >> "$DTS_FILE"
 
         /* --- USER FAN PATCH --- */
@@ -95,23 +92,17 @@ jobs:
         };
         EOF
 
-    # === 4. КОМПИЛЯЦИЯ DTB ===
+    # === 4. КОМПИЛЯЦИЯ ТОЛЬКО DTB ===
     - name: Compile DTB
       working-directory: ./sdk
-      run: |
-        # Компилируем только ядро (DTS собирается вместе с ним)
-        make target/linux/compile -j$(nproc)
+      run: make target/linux/compile -j$(nproc)
 
-    - name: Extract Golden DTB
+    - name: Extract DTB
       working-directory: ./sdk
       run: |
         DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
-        if [ -z "$DTB" ]; then
-           echo "❌ ERROR: DTB binary not found!"
-           exit 1
-        fi
+        if [ -z "$DTB" ]; then echo "❌ DTB missing"; exit 1; fi
         cp "$DTB" ../golden_patched.dtb
-        echo "✅ FOUND: ../golden_patched.dtb"
 
     # === 5. IMAGE BUILDER ===
     - name: Download ImageBuilder
@@ -121,20 +112,18 @@ jobs:
         tar --zstd -xvf ib.tar.zst
         mv openwrt-imagebuilder-* imagebuilder
 
-    - name: Build Final Firmware
+    - name: Build Firmware
       working-directory: ./imagebuilder
       run: |
-        # Прогрев (создание папок)
+        # Прогрев
         make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
         
-        # Подмена DTB
+        # Подмена
         TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         if [ -z "$TARGET_DTB" ]; then
            make target/linux/prepare || true
            TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         fi
-        
-        echo "🔄 Replacing $TARGET_DTB"
         cp ../golden_patched.dtb "$TARGET_DTB"
         
         # Сборка
