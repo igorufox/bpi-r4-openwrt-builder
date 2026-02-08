@@ -1,4 +1,4 @@
-name: Build BPi-R4 (Source Kernel + ImageBuilder)
+name: Robust Hybrid Build (Toolchain + Kernel + IB)
 
 on:
   workflow_dispatch:
@@ -30,10 +30,10 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt update
-        # Твой набор + пару важных библиотек, чтобы make не падал на host-tools
+        # Полный набор пакетов для сборки тулчейна (включая elfutils)
         sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
         gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget zstd \
-        libelf-dev autopoint pkg-config
+        libelf-dev autopoint pkg-config autoconf automake libsqlite3-dev libarchive-dev
 
     - name: Clone OpenWrt Source
       run: git clone --depth 1 --branch v${{ env.RELEASE }} https://github.com/openwrt/openwrt.git openwrt
@@ -41,7 +41,7 @@ jobs:
     - name: Update Feeds
       working-directory: ./openwrt
       run: |
-        # Используем стандартный механизм фидов, как в твоем рабочем конфиге
+        # Стандартная установка фидов
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
@@ -60,7 +60,6 @@ jobs:
       run: |
         DTS_FILE="target/linux/mediatek/dts/mt7988a-bananapi-bpi-r4.dts"
         echo "Patching $DTS_FILE ..."
-        
         cat << 'EOF' >> $DTS_FILE
         /* --- USER FAN PATCH --- */
         &pwm { status = "okay"; };
@@ -81,11 +80,21 @@ jobs:
         };
         EOF
 
+    # === КРИТИЧЕСКИЙ ЭТАП: СБОРКА КОМПИЛЯТОРА ===
+    - name: Build Toolchain
+      working-directory: ./openwrt
+      run: |
+        # Сначала собираем инструменты хоста (чтобы не было ошибки с m4/flex)
+        make tools/install -j$(nproc) || make tools/install -j1 V=s
+        
+        # Затем собираем сам компилятор (gcc для ARM)
+        # БЕЗ ЭТОГО ШАГА СБОРКА ЯДРА УПАДЕТ С ОШИБКОЙ "gcc: No such file"
+        make toolchain/install -j$(nproc) || make toolchain/install -j1 V=s
+
     - name: Compile Kernel & DTB
       working-directory: ./openwrt
       run: |
-        # Запускаем сборку только ядра. Make сам соберет toolchain и tools в нужном порядке.
-        # Это надежнее, чем запускать их руками.
+        # Теперь, когда gcc есть, собираем ядро
         make target/linux/compile -j$(nproc) || make target/linux/compile -j1 V=s
 
     - name: Extract Golden DTB
@@ -93,7 +102,7 @@ jobs:
       run: |
         DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
         if [ -z "$DTB" ]; then
-           echo "❌ ERROR: DTB not found! Build failed?"
+           echo "❌ ERROR: DTB not found!"
            exit 1
         fi
         cp "$DTB" ../golden_patched.dtb
@@ -112,7 +121,7 @@ jobs:
         # Прогрев
         make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
         
-        # Подмена файла
+        # Подмена
         TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         if [ -z "$TARGET_DTB" ]; then
            make target/linux/prepare || true
@@ -120,7 +129,7 @@ jobs:
         fi
         cp ../golden_patched.dtb "$TARGET_DTB"
         
-        # Сборка
+        # Финал
         make image PROFILE="${{ env.PROFILE }}" \
         PACKAGES="kmod-hwmon-pwmfan kmod-nvme kmod-fs-ext4 kmod-usb-storage kmod-usb-storage-uas block-mount e2fsprogs fdisk ethtool luci-ssl-nginx nano htop"
 
