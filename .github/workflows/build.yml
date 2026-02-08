@@ -1,4 +1,4 @@
-name: BPi-R4 Fixed SDK Build
+name: SDK Build (Surgical Fix)
 
 on:
   workflow_dispatch:
@@ -40,31 +40,35 @@ jobs:
         tar --zstd -xvf sdk.tar.zst
         mv openwrt-sdk-* sdk
 
-    # === 2. ПОДГОТОВКА (ХАК ДЛЯ NGINX) ===
+    # === 2. ПОДГОТОВКА И ЧИСТКА ===
     - name: Prepare Kernel Source
       working-directory: ./sdk
       run: |
-        # 1. Обновляем и ставим ВСЕ фиды (нужно для зависимостей ядра)
+        # 1. Ставим фиды (нужны для ядра)
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         
-        # 2. УДАЛЯЕМ NGINX, чтобы не было ошибки рекурсии (Recursive dependency)
-        # Мы все равно будем ставить готовый nginx через ImageBuilder, исходники нам не нужны
-        rm -rf feeds/packages/net/nginx
+        # 2. 🔥 УДАЛЯЕМ СЛОМАННЫЕ ПАКЕТЫ 🔥
+        # Эти пакеты вызывают ошибку "recursive dependency". Удаляем их к чертям.
+        rm -rf package/feeds/packages/mutt
+        rm -rf package/feeds/packages/qemu
+        rm -rf package/feeds/packages/gensio
+        rm -rf package/feeds/telephony/asterisk
         rm -rf package/feeds/packages/nginx
         
-        # 3. Теперь конфиг соберется без ошибок
+        echo "✅ Broken packages removed."
+        
+        # 3. Теперь конфиг проглотится
         cat > .config <<EOF
         CONFIG_TARGET_mediatek=y
         CONFIG_TARGET_mediatek_filogic=y
         CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y
         EOF
-        make defconfig
         
-        # 4. Распаковываем ядро
+        make defconfig
         make target/linux/prepare
 
-    # === 3. ПАТЧ ВЕНТИЛЯТОР (РАБОЧИЙ) ===
+    # === 3. ПАТЧ ВЕНТИЛЯТОРА ===
     - name: Apply Fan Patch
       working-directory: ./sdk
       run: |
@@ -92,7 +96,7 @@ jobs:
         };
         EOF
 
-    # === 4. КОМПИЛЯЦИЯ ТОЛЬКО DTB ===
+    # === 4. КОМПИЛЯЦИЯ DTB ===
     - name: Compile DTB
       working-directory: ./sdk
       run: make target/linux/compile -j$(nproc)
