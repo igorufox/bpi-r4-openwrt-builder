@@ -1,11 +1,10 @@
-name: SDK Surgical Fix (Final)
+name: Full Source Build (Standard Way)
 
 on:
   workflow_dispatch:
 
 env:
   RELEASE: 25.12.0-rc4
-  BASE_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic
   PROFILE: bananapi_bpi-r4
 
 jobs:
@@ -28,67 +27,39 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt update
+        # Полный набор библиотек, чтобы tools (elfutils) собрались без ошибок
         sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-        gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget zstd
+        gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget zstd \
+        libelf-dev autopoint pkg-config autoconf automake libtool \
+        libarchive-dev libcurl4-openssl-dev libsqlite3-dev libmicrohttpd-dev
 
-    # === 1. СКАЧИВАЕМ SDK ===
-    - name: Download SDK
-      run: |
-        wget -q "${{ env.BASE_URL }}/sha256sums" -O sha256sums
-        SDK_FILE=$(grep -o "openwrt-sdk-.*\.tar\.zst" sha256sums | head -n 1)
-        wget "${{ env.BASE_URL }}/$SDK_FILE" -O sdk.tar.zst
-        tar --zstd -xvf sdk.tar.zst
-        mv openwrt-sdk-* sdk
+    - name: Clone OpenWrt Source
+      run: git clone --depth 1 --branch v${{ env.RELEASE }} https://github.com/openwrt/openwrt.git openwrt
 
-    # === 2. ПОДГОТОВКА И ХИРУРГИЧЕСКОЕ УДАЛЕНИЕ ===
-    - name: Prepare SDK & Cut Cancer
-      working-directory: ./sdk
+    - name: Setup Feeds
+      working-directory: ./openwrt
       run: |
-        # 1. Ставим фиды (нужно для firmware)
+        # Делаем тупо как ты сказал: обновляем и ставим ВСЕ.
         ./scripts/feeds update -a
         ./scripts/feeds install -a
-        
-        # 2. УДАЛЯЕМ КОНКРЕТНЫЕ ОШИБКИ ИЗ ТВОЕГО ЛОГА
-        echo "🔪 Performing surgery on broken packages..."
-        
-        # Ошибка busybox (самая критичная)
-        rm -rf package/feeds/packages/busybox
-        
-        # Ошибки из лога (netatalk, fwupd, php8, mail, zabbix)
-        rm -rf package/feeds/packages/netatalk
-        rm -rf package/feeds/packages/fwupd
-        rm -rf package/feeds/packages/php8
-        rm -rf package/feeds/packages/dovecot
-        rm -rf package/feeds/packages/postfix
-        rm -rf package/feeds/packages/zabbix
-        
-        # Ошибки из прошлых логов (на всякий случай)
-        rm -rf package/feeds/packages/mutt
-        rm -rf package/feeds/packages/nginx
-        rm -rf package/feeds/packages/curl
-        rm -rf package/feeds/telephony/asterisk
-        rm -rf package/feeds/packages/gensio
-        rm -rf package/feeds/packages/qemu
-        
-        echo "✅ Bad packages removed. Configuring..."
-        
-        # 3. Генерируем конфиг
+
+    - name: Configure Target
+      working-directory: ./openwrt
+      run: |
+        # Настраиваем цель на R4
         cat > .config <<EOF
         CONFIG_TARGET_mediatek=y
         CONFIG_TARGET_mediatek_filogic=y
         CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y
         EOF
         
+        # Применяем дефолтные настройки (это разрешит зависимости)
         make defconfig
-        
-        # 4. Распаковываем ядро
-        make target/linux/prepare
 
-    # === 3. ПАТЧ ВЕНТИЛЯТОРА ===
-    - name: Apply Fan Patch
-      working-directory: ./sdk
+    - name: 🔥 APPLY FAN PATCH
+      working-directory: ./openwrt
       run: |
-        DTS_FILE=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" | head -n 1)
+        DTS_FILE="target/linux/mediatek/dts/mt7988a-bananapi-bpi-r4.dts"
         echo "Patching $DTS_FILE ..."
         
         cat << 'EOF' >> "$DTS_FILE"
@@ -112,43 +83,57 @@ jobs:
         };
         EOF
 
-    # === 4. КОМПИЛЯЦИЯ DTB ===
-    - name: Compile DTB
-      working-directory: ./sdk
-      run: make target/linux/compile -j$(nproc)
+    - name: Compile Tools & Toolchain
+      working-directory: ./openwrt
+      run: |
+        # Сначала собираем инструменты (make tools), потом компилятор (make toolchain)
+        # Делаем это явно, чтобы не было гонки процессов
+        echo "Building Tools..."
+        make tools/install -j$(nproc) || make tools/install -j1 V=s
+        
+        echo "Building Toolchain..."
+        make toolchain/install -j$(nproc) || make toolchain/install -j1 V=s
+
+    - name: Compile Kernel (DTB)
+      working-directory: ./openwrt
+      run: |
+        # Теперь собираем ядро с нашим патчем
+        echo "Building Kernel..."
+        make target/linux/compile -j$(nproc) || make target/linux/compile -j1 V=s
 
     - name: Extract DTB
-      working-directory: ./sdk
+      working-directory: ./openwrt
       run: |
         DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
         if [ -z "$DTB" ]; then echo "❌ DTB missing"; exit 1; fi
         cp "$DTB" ../golden_patched.dtb
         echo "✅ DTB Extracted"
 
-    # === 5. IMAGE BUILDER ===
-    - name: Download ImageBuilder
+    # === IMAGE BUILDER (Собираем прошивку из готовых пакетов + наш DTB) ===
+    - name: Build Firmware with ImageBuilder
       run: |
-        wget -q "${{ env.BASE_URL }}/sha256sums" -O sha256sums
+        # Скачиваем ImageBuilder
+        BASE_URL="https://downloads.openwrt.org/releases/${{ env.RELEASE }}/targets/mediatek/filogic"
+        wget -q "$BASE_URL/sha256sums" -O sha256sums
         IB_FILE=$(grep -o "openwrt-imagebuilder-.*\.tar\.zst" sha256sums | head -n 1)
-        wget "${{ env.BASE_URL }}/$IB_FILE" -O ib.tar.zst
+        wget "$BASE_URL/$IB_FILE" -O ib.tar.zst
         tar --zstd -xvf ib.tar.zst
         mv openwrt-imagebuilder-* imagebuilder
 
-    - name: Build Firmware
-      working-directory: ./imagebuilder
-      run: |
+        cd imagebuilder
+        
         # Прогрев
         make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
         
-        # Подмена
+        # Подмена DTB на наш скомпилированный
         TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         if [ -z "$TARGET_DTB" ]; then
            make target/linux/prepare || true
            TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         fi
-        cp ../golden_patched.dtb "$TARGET_DTB"
+        cp ../../golden_patched.dtb "$TARGET_DTB"
         
-        # Сборка
+        # Финальная сборка
         make image PROFILE="${{ env.PROFILE }}" \
         PACKAGES="kmod-hwmon-pwmfan kmod-nvme kmod-fs-ext4 kmod-usb-storage kmod-usb-storage-uas block-mount e2fsprogs fdisk ethtool luci-ssl-nginx nano htop"
 
