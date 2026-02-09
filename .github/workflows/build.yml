@@ -1,11 +1,10 @@
-name: SDK Build (Surgical Fix)
+name: Sniper Build (Selective Feeds)
 
 on:
   workflow_dispatch:
 
 env:
   RELEASE: 25.12.0-rc4
-  BASE_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic
   PROFILE: bananapi_bpi-r4
 
 jobs:
@@ -28,55 +27,48 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt update
+        # Важно: libelf-dev, autoconf, automake нужны для сборки инструментов (elfutils)
         sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-        gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget zstd
+        gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget zstd \
+        libelf-dev autopoint pkg-config autoconf automake libsqlite3-dev libarchive-dev
 
-    # === 1. СКАЧИВАЕМ SDK ===
-    - name: Download SDK
-      run: |
-        wget -q "${{ env.BASE_URL }}/sha256sums" -O sha256sums
-        SDK_FILE=$(grep -o "openwrt-sdk-.*\.tar\.zst" sha256sums | head -n 1)
-        wget "${{ env.BASE_URL }}/$SDK_FILE" -O sdk.tar.zst
-        tar --zstd -xvf sdk.tar.zst
-        mv openwrt-sdk-* sdk
+    - name: Clone OpenWrt Source
+      run: git clone --depth 1 --branch v${{ env.RELEASE }} https://github.com/openwrt/openwrt.git openwrt
 
-    # === 2. ПОДГОТОВКА И ЧИСТКА ===
-    - name: Prepare Kernel Source
-      working-directory: ./sdk
+    - name: Update & Install Selective Feeds
+      working-directory: ./openwrt
       run: |
-        # 1. Ставим фиды (нужны для ядра)
         ./scripts/feeds update -a
-        ./scripts/feeds install -a
         
-        # 2. 🔥 УДАЛЯЕМ СЛОМАННЫЕ ПАКЕТЫ 🔥
-        # Эти пакеты вызывают ошибку "recursive dependency". Удаляем их к чертям.
-        rm -rf package/feeds/packages/mutt
-        rm -rf package/feeds/packages/qemu
-        rm -rf package/feeds/packages/gensio
-        rm -rf package/feeds/telephony/asterisk
-        rm -rf package/feeds/packages/nginx
-        
-        echo "✅ Broken packages removed."
-        
-        # 3. Теперь конфиг проглотится
+        # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ ---
+        # Мы НЕ делаем install -a. Мы ставим точечно только то, что нужно.
+        # Это позволяет избежать ошибок "recursive dependency" в пакетах типа curl/asterisk,
+        # которые нам вообще не нужны для сборки ядра.
+        ./scripts/feeds install kmod-hwmon-pwmfan
+        ./scripts/feeds install kmod-nvme
+        ./scripts/feeds install luci-ssl-nginx
+        ./scripts/feeds install ethtool
+        # Базовые системные пакеты подтянутся сами как зависимости.
+
+    - name: Configure Target
+      working-directory: ./openwrt
+      run: |
         cat > .config <<EOF
         CONFIG_TARGET_mediatek=y
         CONFIG_TARGET_mediatek_filogic=y
         CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y
+        # Включаем нужные модули в ядре сразу
+        CONFIG_PACKAGE_kmod-hwmon-pwmfan=y
+        CONFIG_PACKAGE_kmod-nvme=y
         EOF
-        
         make defconfig
-        make target/linux/prepare
 
-    # === 3. ПАТЧ ВЕНТИЛЯТОРА ===
-    - name: Apply Fan Patch
-      working-directory: ./sdk
+    - name: 🔥 APPLY FAN PATCH
+      working-directory: ./openwrt
       run: |
-        DTS_FILE=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" | head -n 1)
-        
-        echo "Patching $DTS_FILE..."
-        cat << 'EOF' >> "$DTS_FILE"
-
+        DTS_FILE="target/linux/mediatek/dts/mt7988a-bananapi-bpi-r4.dts"
+        echo "Patching $DTS_FILE ..."
+        cat << 'EOF' >> $DTS_FILE
         /* --- USER FAN PATCH --- */
         &pwm { status = "okay"; };
         &pio {
@@ -96,23 +88,33 @@ jobs:
         };
         EOF
 
-    # === 4. КОМПИЛЯЦИЯ DTB ===
-    - name: Compile DTB
-      working-directory: ./sdk
-      run: make target/linux/compile -j$(nproc)
+    - name: Build Toolchain & Kernel
+      working-directory: ./openwrt
+      run: |
+        # 1. Собираем инструменты (благодаря libelf-dev ошибки elfutils не будет)
+        make tools/install -j$(nproc) || make tools/install -j1 V=s
+        
+        # 2. Собираем компилятор
+        make toolchain/install -j$(nproc) || make toolchain/install -j1 V=s
+        
+        # 3. Собираем ядро и DTB
+        make target/linux/compile -j$(nproc) || make target/linux/compile -j1 V=s
 
     - name: Extract DTB
-      working-directory: ./sdk
+      working-directory: ./openwrt
       run: |
         DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
         if [ -z "$DTB" ]; then echo "❌ DTB missing"; exit 1; fi
         cp "$DTB" ../golden_patched.dtb
+        echo "✅ DTB Extracted"
 
-    # === 5. IMAGE BUILDER ===
+    # === IMAGE BUILDER ===
     - name: Download ImageBuilder
       run: |
+        BASE_URL="https://downloads.openwrt.org/releases/${{ env.RELEASE }}/targets/mediatek/filogic"
+        wget -q "$BASE_URL/sha256sums" -O sha256sums
         IB_FILE=$(grep -o "openwrt-imagebuilder-.*\.tar\.zst" sha256sums | head -n 1)
-        wget "${{ env.BASE_URL }}/$IB_FILE" -O ib.tar.zst
+        wget "$BASE_URL/$IB_FILE" -O ib.tar.zst
         tar --zstd -xvf ib.tar.zst
         mv openwrt-imagebuilder-* imagebuilder
 
@@ -122,7 +124,7 @@ jobs:
         # Прогрев
         make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
         
-        # Подмена
+        # Подмена DTB
         TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         if [ -z "$TARGET_DTB" ]; then
            make target/linux/prepare || true
