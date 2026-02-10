@@ -1,12 +1,12 @@
-name: Build OpenWrt BPi-R4 (Source DTB + Official Kernel)
+name: Build OpenWrt BPi-R4 (Working Source + IB)
 
 on:
   workflow_dispatch:
 
 env:
-  # Настройки версии
   RELEASE: 25.12.0-rc4
   PROFILE: bananapi_bpi-r4
+  # Ссылка на ImageBuilder для финальной сборки
   IB_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic/openwrt-imagebuilder-25.12.0-rc4-mediatek-filogic.Linux-x86_64.tar.zst
 
 jobs:
@@ -30,23 +30,23 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt update
-        # Твой рабочий набор + libelf/libarchive для гарантии (чтобы не упало случайно)
         sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
         gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
-        file wget libelf-dev libarchive-dev
+        file wget libelf-dev
 
-    # === СБОРКА ИЗ ИСХОДНИКОВ (ДЛЯ ПОЛУЧЕНИЯ DTB) ===
-    - name: Clone OpenWrt Source
+    - name: Clone OpenWrt Source (Tag v25.12.0-rc4)
       run: |
         git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
         cd openwrt
-        # Твои рабочие фиксы фидов
+        
+        # Твои фиксы фидов (как в рабочем конфиге)
         sed -i '/src-git video/d' feeds.conf.default
         sed -i '/src-git telephony/d' feeds.conf.default
+        
         ./scripts/feeds update -a || true
         ./scripts/feeds install -a || true
 
-    - name: Configure Target
+    - name: Configure Target (BPi-R4)
       working-directory: ./openwrt
       run: |
         echo "CONFIG_TARGET_mediatek=y" > .config
@@ -55,7 +55,7 @@ jobs:
         echo "CONFIG_PACKAGE_kmod-hwmon-pwmfan=y" >> .config
         make defconfig
 
-    - name: Inject ODI Support (Patch)
+    - name: Inject ODI Support (Safe Script Method)
       working-directory: ./openwrt
       run: |
         make target/linux/prepare V=s
@@ -93,17 +93,23 @@ jobs:
         };
         EOF
 
-    - name: Compile Source (To Get DTB)
+    - name: Download Sources
       working-directory: ./openwrt
-      run: |
-        # Нам нужно только ядро и DTB, полная сборка не обязательна, но раз у тебя работало - пусть молотит
-        # Я ускорил это: target/linux/compile соберет ядро и DTB быстрее, чем make world
-        make target/linux/compile -j$(nproc) || make target/linux/compile -j1 V=s
+      run: make download -j8
 
-    - name: 💎 EXTRACT GOLDEN DTB
+    - name: Compile Firmware (Source Build)
       working-directory: ./openwrt
       run: |
-        # Ищем скомпилированный DTB файл
+        # ВОЗВРАЩАЕМ КАК БЫЛО У ТЕБЯ. Полная сборка.
+        # Это долго (1 час), но это гарантированно работает и создает правильный DTB.
+        make -j$(nproc) || make -j1 V=s
+
+    # === НАЧАЛО НОВОЙ ЛОГИКИ (IMAGE BUILDER) ===
+    
+    - name: Extract Golden DTB
+      working-directory: ./openwrt
+      run: |
+        # Ищем файл .dtb, который только что скомпилировался
         DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
         
         if [ -z "$DTB" ]; then
@@ -111,34 +117,30 @@ jobs:
            exit 1
         fi
         
-        # Копируем его в корень, чтобы ImageBuilder его увидел
+        # Копируем его в безопасное место
         cp "$DTB" ../golden_patched.dtb
-        echo "✅ SUCCESS: Extracted $DTB to ../golden_patched.dtb"
+        echo "✅ Found and extracted: $DTB"
 
-    # === СБОРКА ФИНАЛЬНОГО ОБРАЗА (IMAGEBUILDER) ===
     - name: Setup ImageBuilder
       run: |
+        # Скачиваем официальный ImageBuilder
         wget ${{ env.IB_URL }} -O ib.tar.zst
         tar --zstd -xvf ib.tar.zst
         mv openwrt-imagebuilder-* imagebuilder
 
-    - name: Prepare ImageBuilder
+    - name: Inject Patched DTB
       working-directory: ./imagebuilder
       run: |
-        # Холостой прогон, чтобы распаковать внутренности и создать папки
+        # Прогреваем, чтобы распаковались папки
         make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
-
-    - name: 💉 INJECT GOLDEN DTB (Official Kernel + Custom DTB)
-      working-directory: ./imagebuilder
-      run: |
-        # Ищем, куда ImageBuilder положил свой стоковый DTB
-        # Обычно это build_dir/target-.../linux-.../image-.../
+        
+        # Находим, где лежит стоковый DTB внутри ImageBuilder
         TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         
         if [ -z "$TARGET_DTB" ]; then
-           # Если не нашел, пнем его сильнее
-           make target/linux/prepare || true
-           TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
+             # Если не нашел, пробуем подготовить ядро
+             make target/linux/prepare || true
+             TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         fi
         
         if [ -z "$TARGET_DTB" ]; then
@@ -148,14 +150,13 @@ jobs:
 
         echo "🔄 Replacing stock DTB at: $TARGET_DTB"
         cp ../golden_patched.dtb "$TARGET_DTB"
-        echo "✅ DTB Replaced!"
+        echo "✅ DTB Replaced successfully!"
 
-    - name: Build Final Official Image
+    - name: Build Final Image (Official Kernel + Fan Patch)
       working-directory: ./imagebuilder
       run: |
-        # Создаем скрипт вентилятора прямо в ImageBuilder (files/etc/init.d/...)
+        # Создаем скрипт управления вентилятором
         mkdir -p files/etc/init.d
-        
         cat << 'EOF' > files/etc/init.d/fan_control
         #!/bin/sh /etc/rc.common
         START=99
@@ -164,8 +165,12 @@ jobs:
             procd_open_instance
             procd_set_param command /bin/sh -c '
                 FAN_DEV="/sys/class/thermal/cooling_device1/cur_state"
+                if [ "$(cat /sys/class/thermal/cooling_device1/max_state)" != "4" ]; then
+                    for d in /sys/class/thermal/cooling_device*; do
+                        if [ "$(cat $d/max_state)" = "4" ]; then FAN_DEV="$d/cur_state"; break; fi
+                    done
+                fi
                 while true; do
-                    # Простая логика (можно заменить на твою сложную)
                     echo 1 > "$FAN_DEV"
                     sleep 10
                 done
@@ -176,15 +181,14 @@ jobs:
         EOF
         chmod +x files/etc/init.d/fan_control
 
-        # Собираем финалочку
-        make image PROFILE="${{ env.PROFILE }}" \
-        FILES="files" \
+        # Собираем прошивку с нужными пакетами
+        make image PROFILE="${{ env.PROFILE }}" FILES="files" \
         PACKAGES="kmod-hwmon-pwmfan kmod-nvme kmod-fs-ext4 kmod-usb-storage kmod-usb-storage-uas block-mount e2fsprogs fdisk ethtool luci-ssl-nginx nano htop"
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BPi-R4-Official-Kernel-Patched-DTB
+        name: BPi-R4-Official-Kernel-Patched
         path: |
           imagebuilder/bin/targets/mediatek/filogic/*sysupgrade.itb
           imagebuilder/bin/targets/mediatek/filogic/*sdcard.img.gz
