@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (Working + IB)
+name: Build OpenWrt BPi-R4 (Final Clean + IB)
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ on:
       - master
 
 env:
-  RELEASE: 25.12.0-rc4
-  PROFILE: bananapi_bpi-r4
+  # Ссылка на ImageBuilder 25.12.0-rc4
   IB_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic/openwrt-imagebuilder-25.12.0-rc4-mediatek-filogic.Linux-x86_64.tar.zst
+  PROFILE: bananapi_bpi-r4
 
 jobs:
   build:
@@ -33,8 +33,6 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt update
-        # ВОЗВРАЩЕНО КАК БЫЛО У ТЕБЯ (без libelf-dev, без autopoint)
-        # Это работало 48 минут назад, значит будет работать и сейчас.
         sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
         gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
         file wget
@@ -58,9 +56,8 @@ jobs:
         echo "CONFIG_TARGET_mediatek=y" > .config
         echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
         echo "CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y" >> .config
-        # Добавляем пакеты, чтобы они были в .config (влияет на сборку DTB косвенно)
         echo "CONFIG_PACKAGE_luci=y" >> .config
-        echo "CONFIG_PACKAGE_kmod-hwmon-pwmfan=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-pwm-fan=y" >> .config
         echo "CONFIG_PACKAGE_ethtool-full=y" >> .config 
         make defconfig
 
@@ -81,7 +78,7 @@ jobs:
         sed -i -f odi_patch.sed "$SFP_FILE"
         grep -C 3 "ODI" "$SFP_FILE"
 
-    - name: Apply Fan DTS
+    - name: Apply Fan DTS (5 Steps)
       working-directory: ./openwrt
       run: |
         DTS_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
@@ -101,7 +98,7 @@ jobs:
         / {
             sfp_fan: sfp-fan {
                 compatible = "pwm-fan";
-                pwms = <&pwm 6 50000 0>;
+                pwms = <&pwm 6 50000>;
                 pinctrl-names = "default";
                 pinctrl-0 = <&pwm6_pins>;
                 cooling-levels = <0 75 125 180 255>;
@@ -110,31 +107,82 @@ jobs:
         };
         EOF
 
+    - name: Create Fan Control Script
+      working-directory: ./openwrt
+      run: |
+        mkdir -p package/base-files/files/etc/init.d/
+        cat << 'EOF' > package/base-files/files/etc/init.d/fan_control
+        #!/bin/sh /etc/rc.common
+        START=99
+        USE_PROCD=1
+        
+        start_service() {
+            procd_open_instance
+            procd_set_param command /bin/sh -c '
+                FAN_DEV="/sys/class/thermal/cooling_device1/cur_state"
+                if [ "$(cat /sys/class/thermal/cooling_device1/max_state)" != "4" ]; then
+                    for d in /sys/class/thermal/cooling_device*; do
+                        if [ "$(cat $d/max_state)" = "4" ]; then FAN_DEV="$d/cur_state"; break; fi
+                    done
+                fi
+                while true; do
+                    MAX_TEMP=0
+                    for hw in /sys/class/hwmon/hwmon*; do
+                        NAME=$(cat "$hw/name" 2>/dev/null)
+                        if echo "$NAME" | grep -q "mt7996"; then
+                            for t in "$hw"/temp*_input; do
+                                [ -f "$t" ] || continue
+                                TEMP=$(cat "$t"); TEMP=$((TEMP / 1000))
+                                if [ "$TEMP" -gt "$MAX_TEMP" ]; then MAX_TEMP=$TEMP; fi
+                            done
+                        fi
+                    done
+                    
+                    if [ "$MAX_TEMP" -eq 0 ]; then
+                        CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
+                        MAX_TEMP=$((CPU_T / 1000))
+                    fi
+                    if [ "$MAX_TEMP" -ge 68 ]; then NEW=4
+                    elif [ "$MAX_TEMP" -ge 60 ]; then NEW=3
+                    elif [ "$MAX_TEMP" -ge 52 ]; then NEW=2
+                    elif [ "$MAX_TEMP" -ge 45 ]; then NEW=1
+                    elif [ "$MAX_TEMP" -le 40 ]; then NEW=0
+                    else CUR=$(cat "$FAN_DEV"); if [ "$CUR" -gt 0 ]; then NEW="$CUR"; else NEW=0; fi
+                    fi
+                    if [ "$(cat $FAN_DEV)" != "$NEW" ]; then echo "$NEW" > "$FAN_DEV"; fi
+                    sleep 5
+                done
+            '
+            procd_set_param respawn
+            procd_close_instance
+        }
+        EOF
+        chmod +x package/base-files/files/etc/init.d/fan_control
+
     - name: Download Sources
       working-directory: ./openwrt
       run: make download -j8
 
-    - name: Compile Firmware (Source Build)
+    - name: Compile Firmware (Full Source Build)
       working-directory: ./openwrt
       run: |
-        # Тот самый долгий, но рабочий процесс
         make -j$(nproc) || make -j1 V=s
 
-    # === ЛОГИКА IMAGE BUILDER (ДОБАВЛЕНО) ===
+    # === ОТСЮДА НАЧИНАЮТСЯ НОВЫЕ ШАГИ ДЛЯ IMAGEBUILDER ===
 
     - name: Extract Golden DTB
       working-directory: ./openwrt
       run: |
-        # Ищем DTB
-        DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
+        # Ищем файл .dtb, который собрался в предыдущем шаге
+        DTB=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         
         if [ -z "$DTB" ]; then
            echo "❌ ERROR: Patched DTB not found!"
            exit 1
         fi
         
+        echo "✅ Found DTB: $DTB"
         cp "$DTB" ../golden_patched.dtb
-        echo "✅ DTB Extracted: $DTB"
 
     - name: Setup ImageBuilder
       run: |
@@ -142,13 +190,13 @@ jobs:
         tar --zstd -xvf ib.tar.zst
         mv openwrt-imagebuilder-* imagebuilder
 
-    - name: Inject Patched DTB
+    - name: Inject Patched DTB and Script
       working-directory: ./imagebuilder
       run: |
-        # Прогрев
+        # 1. Прогрев (распаковка ядра)
         make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
         
-        # Поиск стокового DTB
+        # 2. Подмена DTB
         TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         
         if [ -z "$TARGET_DTB" ]; then
@@ -163,12 +211,12 @@ jobs:
 
         echo "🔄 Replacing stock DTB at: $TARGET_DTB"
         cp ../golden_patched.dtb "$TARGET_DTB"
-
-    - name: Build Final Official Image
-      working-directory: ./imagebuilder
-      run: |
-        # Создаем скрипт управления вентилятором
+        
+        # 3. Перенос скрипта вентилятора
+        # Мы должны создать файл внутри папки ImageBuilder, так как package/base-files из Source Build сюда не попадает
         mkdir -p files/etc/init.d
+        
+        # Вставляем тот же самый скрипт
         cat << 'EOF' > files/etc/init.d/fan_control
         #!/bin/sh /etc/rc.common
         START=99
@@ -183,9 +231,30 @@ jobs:
                     done
                 fi
                 while true; do
-                    # Простая логика включения (можно заменить на скрипт выше)
-                    echo 1 > "$FAN_DEV"
-                    sleep 10
+                    MAX_TEMP=0
+                    for hw in /sys/class/hwmon/hwmon*; do
+                        NAME=$(cat "$hw/name" 2>/dev/null)
+                        if echo "$NAME" | grep -q "mt7996"; then
+                            for t in "$hw"/temp*_input; do
+                                [ -f "$t" ] || continue
+                                TEMP=$(cat "$t"); TEMP=$((TEMP / 1000))
+                                if [ "$TEMP" -gt "$MAX_TEMP" ]; then MAX_TEMP=$TEMP; fi
+                            done
+                        fi
+                    done
+                    if [ "$MAX_TEMP" -eq 0 ]; then
+                        CPU_T=$(cat /sys/class/thermal/thermal_zone0/temp)
+                        MAX_TEMP=$((CPU_T / 1000))
+                    fi
+                    if [ "$MAX_TEMP" -ge 68 ]; then NEW=4
+                    elif [ "$MAX_TEMP" -ge 60 ]; then NEW=3
+                    elif [ "$MAX_TEMP" -ge 52 ]; then NEW=2
+                    elif [ "$MAX_TEMP" -ge 45 ]; then NEW=1
+                    elif [ "$MAX_TEMP" -le 40 ]; then NEW=0
+                    else CUR=$(cat "$FAN_DEV"); if [ "$CUR" -gt 0 ]; then NEW="$CUR"; else NEW=0; fi
+                    fi
+                    if [ "$(cat $FAN_DEV)" != "$NEW" ]; then echo "$NEW" > "$FAN_DEV"; fi
+                    sleep 5
                 done
             '
             procd_set_param respawn
@@ -194,7 +263,9 @@ jobs:
         EOF
         chmod +x files/etc/init.d/fan_control
 
-        # Собираем
+    - name: Build Final Official Image
+      working-directory: ./imagebuilder
+      run: |
         make image PROFILE="${{ env.PROFILE }}" FILES="files" \
         PACKAGES="kmod-hwmon-pwmfan kmod-nvme kmod-fs-ext4 kmod-usb-storage kmod-usb-storage-uas block-mount e2fsprogs fdisk ethtool luci-ssl-nginx nano htop"
 
