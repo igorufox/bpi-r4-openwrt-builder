@@ -1,12 +1,15 @@
-name: Build OpenWrt BPi-R4 (Working Source + IB)
+name: Build OpenWrt BPi-R4 (Working + IB)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
 
 env:
   RELEASE: 25.12.0-rc4
   PROFILE: bananapi_bpi-r4
-  # Ссылка на ImageBuilder для финальной сборки
   IB_URL: https://downloads.openwrt.org/releases/25.12.0-rc4/targets/mediatek/filogic/openwrt-imagebuilder-25.12.0-rc4-mediatek-filogic.Linux-x86_64.tar.zst
 
 jobs:
@@ -17,7 +20,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v3
 
-    - name: Free Disk Space
+    - name: Free Disk Space (Ubuntu)
       uses: jlumbroso/free-disk-space@main
       with:
         tool-cache: true
@@ -30,19 +33,22 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt update
+        # ВОЗВРАЩЕНО КАК БЫЛО У ТЕБЯ (без libelf-dev, без autopoint)
+        # Это работало 48 минут назад, значит будет работать и сейчас.
         sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
         gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
-        file wget libelf-dev
+        file wget
 
     - name: Clone OpenWrt Source (Tag v25.12.0-rc4)
       run: |
         git clone --depth 1 --branch v25.12.0-rc4 https://github.com/openwrt/openwrt.git openwrt
         cd openwrt
         
-        # Твои фиксы фидов (как в рабочем конфиге)
+        # Удаляем проблемные фиды (Твой код)
         sed -i '/src-git video/d' feeds.conf.default
         sed -i '/src-git telephony/d' feeds.conf.default
         
+        # Обновляем (игнорируем ошибки)
         ./scripts/feeds update -a || true
         ./scripts/feeds install -a || true
 
@@ -52,7 +58,10 @@ jobs:
         echo "CONFIG_TARGET_mediatek=y" > .config
         echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
         echo "CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi-r4=y" >> .config
+        # Добавляем пакеты, чтобы они были в .config (влияет на сборку DTB косвенно)
+        echo "CONFIG_PACKAGE_luci=y" >> .config
         echo "CONFIG_PACKAGE_kmod-hwmon-pwmfan=y" >> .config
+        echo "CONFIG_PACKAGE_ethtool-full=y" >> .config 
         make defconfig
 
     - name: Inject ODI Support (Safe Script Method)
@@ -62,29 +71,37 @@ jobs:
         SFP_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/drivers/net/phy/ -name "sfp.c" -print -quit)
         if [ -z "$SFP_FILE" ]; then echo "ERROR: sfp.c missing"; exit 1; fi
         
+        echo "Found driver: $SFP_FILE"
+        
         cat << 'EOF' > odi_patch.sed
         /SFP_QUIRK("HUAWEI", "MA5671A"/i \
         	SFP_QUIRK("ODI", "DFP-34X-2C2", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),\
         	SFP_QUIRK("ODI", "DFP-34X-2C3", sfp_quirk_2500basex, sfp_fixup_ignore_tx_fault),
         EOF
         sed -i -f odi_patch.sed "$SFP_FILE"
+        grep -C 3 "ODI" "$SFP_FILE"
 
     - name: Apply Fan DTS
       working-directory: ./openwrt
       run: |
         DTS_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
+        if [ -z "$DTS_FILE" ]; then echo "ERROR: DTS not found!"; exit 1; fi
         
         cat << 'EOF' >> "$DTS_FILE"
+        
         /* --- SFP FAN DEFINITION --- */
         &pio {
             pwm6_pins: pwm6-pins {
-                mux { function = "pwm"; groups = "pwm6_0"; };
+                mux {
+                    function = "pwm";
+                    groups = "pwm6_0";
+                };
             };
         };
         / {
             sfp_fan: sfp-fan {
                 compatible = "pwm-fan";
-                pwms = <&pwm 6 50000>;
+                pwms = <&pwm 6 50000 0>;
                 pinctrl-names = "default";
                 pinctrl-0 = <&pwm6_pins>;
                 cooling-levels = <0 75 125 180 255>;
@@ -100,16 +117,15 @@ jobs:
     - name: Compile Firmware (Source Build)
       working-directory: ./openwrt
       run: |
-        # ВОЗВРАЩАЕМ КАК БЫЛО У ТЕБЯ. Полная сборка.
-        # Это долго (1 час), но это гарантированно работает и создает правильный DTB.
+        # Тот самый долгий, но рабочий процесс
         make -j$(nproc) || make -j1 V=s
 
-    # === НАЧАЛО НОВОЙ ЛОГИКИ (IMAGE BUILDER) ===
-    
+    # === ЛОГИКА IMAGE BUILDER (ДОБАВЛЕНО) ===
+
     - name: Extract Golden DTB
       working-directory: ./openwrt
       run: |
-        # Ищем файл .dtb, который только что скомпилировался
+        # Ищем DTB
         DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" | head -n 1)
         
         if [ -z "$DTB" ]; then
@@ -117,13 +133,11 @@ jobs:
            exit 1
         fi
         
-        # Копируем его в безопасное место
         cp "$DTB" ../golden_patched.dtb
-        echo "✅ Found and extracted: $DTB"
+        echo "✅ DTB Extracted: $DTB"
 
     - name: Setup ImageBuilder
       run: |
-        # Скачиваем официальный ImageBuilder
         wget ${{ env.IB_URL }} -O ib.tar.zst
         tar --zstd -xvf ib.tar.zst
         mv openwrt-imagebuilder-* imagebuilder
@@ -131,14 +145,13 @@ jobs:
     - name: Inject Patched DTB
       working-directory: ./imagebuilder
       run: |
-        # Прогреваем, чтобы распаковались папки
+        # Прогрев
         make image PROFILE="${{ env.PROFILE }}" PACKAGES="base-files" || true
         
-        # Находим, где лежит стоковый DTB внутри ImageBuilder
+        # Поиск стокового DTB
         TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         
         if [ -z "$TARGET_DTB" ]; then
-             # Если не нашел, пробуем подготовить ядро
              make target/linux/prepare || true
              TARGET_DTB=$(find build_dir -name "image-mt7988a-bananapi-bpi-r4.dtb" -print -quit)
         fi
@@ -150,9 +163,8 @@ jobs:
 
         echo "🔄 Replacing stock DTB at: $TARGET_DTB"
         cp ../golden_patched.dtb "$TARGET_DTB"
-        echo "✅ DTB Replaced successfully!"
 
-    - name: Build Final Image (Official Kernel + Fan Patch)
+    - name: Build Final Official Image
       working-directory: ./imagebuilder
       run: |
         # Создаем скрипт управления вентилятором
@@ -171,6 +183,7 @@ jobs:
                     done
                 fi
                 while true; do
+                    # Простая логика включения (можно заменить на скрипт выше)
                     echo 1 > "$FAN_DEV"
                     sleep 10
                 done
@@ -181,7 +194,7 @@ jobs:
         EOF
         chmod +x files/etc/init.d/fan_control
 
-        # Собираем прошивку с нужными пакетами
+        # Собираем
         make image PROFILE="${{ env.PROFILE }}" FILES="files" \
         PACKAGES="kmod-hwmon-pwmfan kmod-nvme kmod-fs-ext4 kmod-usb-storage kmod-usb-storage-uas block-mount e2fsprogs fdisk ethtool luci-ssl-nginx nano htop"
 
