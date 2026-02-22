@@ -1,4 +1,4 @@
-name: Build OpenWrt BPi-R4 (RC5 - Pure GPIO-Fan)
+name: Build OpenWrt BPi-R4 (RC5 - PRO Build)
 
 on:
   workflow_dispatch:
@@ -10,11 +10,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install dependencies (Fixed for U-Boot FIP)
         run: |
           sudo apt update
           sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-          gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget
+          gettext git libncurses5-dev libssl-dev python3-distutils python3-setuptools \
+          python3-pyelftools rsync unzip zlib1g-dev file wget device-tree-compiler
 
       - name: Clone OpenWrt (v25.12.0-rc5)
         run: git clone --depth 1 -b v25.12.0-rc5 https://github.com/openwrt/openwrt.git openwrt
@@ -34,12 +35,8 @@ jobs:
           echo "CONFIG_PACKAGE_luci=y" >> .config
           echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
           
-          # ГЛАВНОЕ: Включаем драйвер gpio-fan
+          # Нативный драйвер GPIO-вентилятора
           echo "CONFIG_PACKAGE_kmod-hwmon-gpiofan=y" >> .config
-          
-          # Полезные утилиты
-          echo "CONFIG_PACKAGE_ethtool=y" >> .config
-          echo "CONFIG_PACKAGE_sfp-i2c=y" >> .config
           
           make defconfig
 
@@ -53,33 +50,29 @@ jobs:
           cd openwrt/build_dir/target-*/linux-*/linux-6.12*
           DTS_FILE="arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dts"
 
-          # Дописываем настройки вентилятора в конец файла DTS
           cat << 'EOF_DTS' >> $DTS_FILE
 
           / {
-              /* Объявляем вентилятор как устройство */
               fan_case: gpio-fan {
                   compatible = "gpio-fan";
-                  /* Пин 62 = GPIO 574. Флаг 0 = Active High (1=ВКЛ) */
                   gpios = <&pio 62 0>; 
                   gpio-fan,speed-map = <0 0>, <1 1>;
                   #cooling-cells = <2>;
               };
           };
 
-          /* Привязываем вентилятор к датчику температуры CPU */
           &cpu_thermal {
               trips {
-                  fan_on: trip-point-active {
-                      temperature = <60000>;  /* Вкл при 60°C */
-                      hysteresis = <5000>;    /* Выкл при 55°C */
+                  fan_on: trip-point-active-fan {
+                      temperature = <60000>;
+                      hysteresis = <5000>;
                       type = "active";
                   };
               };
               cooling-maps {
                   map_case_fan {
                       trip = <&fan_on>;
-                      cooling-device = <&fan_case 1 1>; /* 1 = Включить */
+                      cooling-device = <&fan_case 1 1>;
                   };
               };
           };
