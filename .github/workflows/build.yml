@@ -1,11 +1,19 @@
 name: Build BPi-R4 Thermal Mod Firmware
 
 on:
-  workflow_dispatch: # Позволяет запускать сборку вручную по кнопке на GitHub
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'Версия OpenWrt (например, 25.12.1)'
+        required: true
+        default: '25.12.1'
+
+env:
+  OWRT_VER: ${{ github.event.inputs.openwrt_version }}
 
 jobs:
   build:
-    runs-on: ubuntu-latest # Сервер GitHub берет на себя всю компиляцию
+    runs-on: ubuntu-latest
 
     steps:
       - name: 1. Установка зависимостей
@@ -13,9 +21,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libncurses-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip zstd
 
-      - name: 2. Скачивание OpenWrt (25.12.1) и базовая настройка
+      - name: 2. Скачивание OpenWrt и базовая настройка
         run: |
-          git clone --depth 1 --branch v25.12.1 https://git.openwrt.org/openwrt/openwrt.git openwrt-source
+          echo "Сборка версии: $OWRT_VER"
+          git clone --depth 1 --branch v$OWRT_VER https://git.openwrt.org/openwrt/openwrt.git openwrt-source
           cd openwrt-source
           ./scripts/feeds update -a
           ./scripts/feeds install -a
@@ -31,7 +40,6 @@ jobs:
           cd openwrt-source
           make target/linux/prepare -j$(nproc)
           
-          # Ищем DTS и патчим
           DTS_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
           echo "Патчим файл: $DTS_FILE"
           
@@ -85,31 +93,27 @@ jobs:
       - name: 4. Компиляция Золотого DTB
         run: |
           cd openwrt-source
-          # Сервер GitHub соберет всё сам. У бесплатных серверов 2 ядра, так что это займет время.
           make -j$(nproc)
 
       - name: 5. Скачивание Image Builder и копирование DTB
         run: |
-          wget https://downloads.openwrt.org/releases/25.12.1/targets/mediatek/filogic/openwrt-imagebuilder-25.12.1-mediatek-filogic.Linux-x86_64.tar.zst
-          tar --zstd -xf openwrt-imagebuilder-25.12.1-mediatek-filogic.Linux-x86_64.tar.zst
+          wget https://downloads.openwrt.org/releases/$OWRT_VER/targets/mediatek/filogic/openwrt-imagebuilder-$OWRT_VER-mediatek-filogic.Linux-x86_64.tar.zst
+          tar --zstd -xf openwrt-imagebuilder-$OWRT_VER-mediatek-filogic.Linux-x86_64.tar.zst
           
-          # Находим наш скомпилированный DTB из шага 4
           GOLDEN_DTB=$(realpath $(find openwrt-source/build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" -print -quit))
-          echo "Найден скомпилированный DTB: $GOLDEN_DTB"
           
-          # Закидываем в Image Builder
-          TARGET_DIR="openwrt-imagebuilder-25.12.1-mediatek-filogic.Linux-x86_64/build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_filogic"
+          TARGET_DIR="openwrt-imagebuilder-$OWRT_VER-mediatek-filogic.Linux-x86_64/build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_filogic"
           mkdir -p "$TARGET_DIR"
           cp "$GOLDEN_DTB" "$TARGET_DIR/image-mt7988a-bananapi-bpi-r4.dtb"
 
       - name: 6. Сборка финального образа
         run: |
-          cd openwrt-imagebuilder-25.12.1-mediatek-filogic.Linux-x86_64
+          cd openwrt-imagebuilder-$OWRT_VER-mediatek-filogic.Linux-x86_64
           make image PROFILE="bananapi_bpi-r4" PACKAGES="apk-mbedtls base-files ca-bundle dnsmasq dropbear firewall4 fitblk fstools kmod-crypto-hw-safexcel kmod-gpio-button-hotplug kmod-leds-gpio kmod-nft-offload libc libgcc libustream-mbedtls logd mtd netifd nftables odhcp6c odhcpd-ipv6only ppp ppp-mod-pppoe procd-ujail uboot-envtools uci uclient-fetch urandom-seed urngd wpad-basic-mbedtls kmod-hwmon-pwmfan kmod-i2c-mux-pca954x kmod-eeprom-at24 kmod-mt7996-firmware kmod-mt7996-233-firmware kmod-rtc-pcf8563 kmod-sfp kmod-usb3 e2fsprogs f2fsck mkf2fs mt7988-wo-firmware luci"
 
-      - name: 7. Публикация прошивки
+      - name: 7. Публикация всех прошивок (SD, eMMC, NAND)
         uses: actions/upload-artifact@v4
         with:
-          name: BPi-R4-Thermal-Mod-25.12.1
-          path: openwrt-imagebuilder-25.12.1-mediatek-filogic.Linux-x86_64/bin/targets/mediatek/filogic/*sysupgrade.itb
+          name: BPi-R4-Thermal-Mod-${{ env.OWRT_VER }}
+          path: openwrt-imagebuilder-${{ env.OWRT_VER }}-mediatek-filogic.Linux-x86_64/bin/targets/mediatek/filogic/*bananapi_bpi-r4*
           retention-days: 14
