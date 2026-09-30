@@ -1,0 +1,35 @@
+#!/bin/sh /etc/rc.common
+# SFP ONU recovery console (gpiouart) - autostarts an unattended session
+# against the module in the SFP1 (WAN) cage and logs to /root/recovery/.
+# Disable: touch /root/recovery/disable ; extra CLI args: /root/recovery/extra_args
+
+START=99
+STOP=10
+USE_PROCD=1
+PROG=/usr/sbin/gpiouart
+DIR=/root/recovery
+
+start_service() {
+	if [ -f "$DIR/disable" ]; then
+		echo "sfp-recovery: disabled by $DIR/disable" > /dev/console
+		return 0
+	fi
+	mkdir -p "$DIR"
+	# SCHED_FIFO bit-bang threads must never be throttled (default: 50 ms gap every second)
+	echo -1 > /proc/sys/kernel/sched_rt_runtime_us
+	{
+		echo "===== sfp-recovery start $(date) uptime=$(cut -d' ' -f1 /proc/uptime)s build=[$(cat /etc/sfp-recovery.buildinfo 2>/dev/null)] ====="
+		echo "cmdline: $(cat /proc/cmdline)"
+		echo "cpus online: $(cat /sys/devices/system/cpu/online) isolated: $(cat /sys/devices/system/cpu/isolated 2>/dev/null)"
+		$PROG selftest 2>&1
+	} | tee -a "$DIR/console.log" > /dev/console
+
+	procd_open_instance
+	procd_set_param command $PROG auto \
+		--log "$DIR/console.log" --mirror /dev/console \
+		--cmds-uboot "$DIR/cmds_uboot.txt" --cmds-linux "$DIR/cmds_linux.txt" --cmds-failsafe "$DIR/cmds_failsafe.txt" \
+		--state "$DIR/state" $(cat "$DIR/extra_args" 2>/dev/null)
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+}

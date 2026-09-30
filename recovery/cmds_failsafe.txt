@@ -1,0 +1,9 @@
+# OpenWrt failsafe shell on the module: read-only reconnaissance
+mount_root
+cat /etc/config/network
+uci show network
+cat /proc/mtd
+ls -la /overlay
+ls -la /overlay/etc/config /overlay/upper/etc/config
+cat /etc/passwd
+which firstboot jffs2reset uci

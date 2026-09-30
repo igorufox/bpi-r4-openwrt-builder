@@ -1,0 +1,13 @@
+# From a fresh U-Boot (115200): switch console to 9600 (runtime only), load image0 kernel,
+# boot with console at 9600. Nothing is written to flash.
+setenv baudrate 9600
+@baud 9600
+@sleep 300
+@enter
+@enter
+@timeout 60000
+run kernel0_from_sf
+@timeout 10000
+run flashargs addip addmtdparts0 addmisc
+setenv bootargs ${bootargs} console=ttyLTQ0,9600
+bootm ${ram_addr}

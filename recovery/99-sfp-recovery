@@ -1,0 +1,4 @@
+#!/bin/sh
+# first-boot: enable the recovery console service
+/etc/init.d/sfp-recovery enable
+exit 0

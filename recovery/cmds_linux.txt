@@ -1,0 +1,17 @@
+# Команды для Linux-консоли модуля (выполняются после успешного логина).
+# Разведка, read-only. На урезанном minishell часть команд ответит ошибкой — это нормально,
+# нам важно увидеть, что вообще доступно.
+# В конце 'reboot' — чтобы после перезагрузки поймать U-Boot. Уберите строку, если не нужно.
+help
+?
+cat /proc/version
+cat /proc/mtd
+cat /proc/cmdline
+mount
+ifconfig
+cat /etc/config/network
+uci show network
+fw_printenv
+ls -la /etc/config /overlay
+cat /etc/passwd
+reboot
