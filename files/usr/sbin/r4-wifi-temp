@@ -1,0 +1,48 @@
+#!/bin/sh
+# Feeds the MT7996 Wi-Fi card temperature (max over bands, hwmon only) into the emul_temp of the
+# "wifi-thermal" zone, so the kernel drives the fan from it via the zone's trips/cooling-maps.
+# emul_temp = 0 hands the zone back to its real sensor (lvts 3) - done on stop and when the card
+# temperature can't be read.
+#   r4-wifi-temp            - feed loop (run by /etc/init.d/r4-wifi-temp)
+#   r4-wifi-temp --dry-run  - print what it would feed, change nothing
+
+INTERVAL=5
+ZONE_TYPE=wifi-thermal
+
+zone() {
+	for z in /sys/class/thermal/thermal_zone*; do
+		[ "$(cat "$z/type" 2>/dev/null)" = "$ZONE_TYPE" ] && { echo "$z"; return 0; }
+	done
+	return 1
+}
+
+wifi_temp() {
+	m=
+	for h in /sys/class/hwmon/hwmon*; do
+		case "$(cat "$h/name" 2>/dev/null)" in mt7996*) ;; *) continue ;; esac
+		v=$(cat "$h/temp1_input" 2>/dev/null) || continue
+		[ -z "$m" ] || [ "$v" -gt "$m" ] && m=$v
+	done
+	echo "$m"
+}
+
+Z=$(zone) || { echo "r4-wifi-temp: no thermal zone '$ZONE_TYPE'" >&2; exit 1; }
+
+if [ "$1" = "--dry-run" ]; then
+	for h in /sys/class/hwmon/hwmon*; do
+		n=$(cat "$h/name" 2>/dev/null)
+		case "$n" in mt7996*) echo "$n: $(cat "$h/temp1_input" 2>/dev/null)" ;; esac
+	done
+	echo "zone $Z: temp $(cat "$Z/temp"), emul_temp writable: $([ -w "$Z/emul_temp" ] && echo yes || echo no)"
+	echo "would feed: $(wifi_temp)"
+	exit 0
+fi
+
+[ -w "$Z/emul_temp" ] || { echo "r4-wifi-temp: $Z/emul_temp missing (kernel without CONFIG_THERMAL_EMULATION?)" >&2; exit 1; }
+trap 'echo 0 > "$Z/emul_temp"; exit 0' TERM INT
+
+while :; do
+	t=$(wifi_temp)
+	echo "${t:-0}" > "$Z/emul_temp"
+	sleep "$INTERVAL" & wait $!
+done

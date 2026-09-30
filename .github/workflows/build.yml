@@ -4,45 +4,61 @@ on:
   workflow_dispatch:
     inputs:
       openwrt_version:
-        description: 'Версия OpenWrt (например, 25.12.1)'
+        description: 'Версия OpenWrt (>= 25.12.3: в образе есть overlay калибровки BE14)'
         required: true
-        default: '25.12.1'
+        default: '25.12.4'
 
 env:
   OWRT_VER: ${{ github.event.inputs.openwrt_version }}
+  IB_DIR: openwrt-imagebuilder-${{ github.event.inputs.openwrt_version }}-mediatek-filogic.Linux-x86_64
+  KDIR_REL: build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_filogic
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
+      - name: 0. Checkout (files/ для образа)
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
       - name: 1. Установка зависимостей
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libncurses-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip zstd
 
-      - name: 2. Скачивание OpenWrt и базовая настройка
+      - name: 2. Image Builder и официальный config.buildinfo
+        run: |
+          BASE=https://downloads.openwrt.org/releases/$OWRT_VER/targets/mediatek/filogic
+          wget -q $BASE/$IB_DIR.tar.zst
+          tar --zstd -xf $IB_DIR.tar.zst
+          wget -q $BASE/config.buildinfo
+
+      - name: 3. Исходники OpenWrt с официальным конфигом + CONFIG_THERMAL_EMULATION
         run: |
           echo "Сборка версии: $OWRT_VER"
           git clone --depth 1 --branch v$OWRT_VER https://git.openwrt.org/openwrt/openwrt.git openwrt-source
           cd openwrt-source
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          cat <<EOF > .config
-          CONFIG_TARGET_mediatek=y
-          CONFIG_TARGET_mediatek_filogic=y
-          CONFIG_TARGET_mediatek_filogic_DEVICE_bananapi_bpi_r4=y
-          EOF
+          # Конфиг buildbot'а (ALL_KMODS -> тот же набор KCONFIG ядра); без SDK/IB/LLVM — нам нужно только ядро
+          grep -vE '^CONFIG_(SDK|IB|SDK_LLVM_BPF|MAKE_TOOLCHAIN|JSON_CYCLONEDX_SBOM)=' ../config.buildinfo > .config
           make defconfig
+          # Единственное отличие от официального ядра: emul_temp в /sys/class/thermal/thermal_zone*/.
+          # Структуры ядра не меняет (emul_temperature в thermal_zone_device есть всегда), MODVERSIONS
+          # и MODULE_SIG выключены -> официальные kmod из репозитория ставятся и грузятся.
+          echo "CONFIG_THERMAL_EMULATION=y" >> target/linux/mediatek/filogic/config-6.12
 
-      - name: 3. Подготовка ядра и внедрение патча (4 уровня, 50-65°C)
+      - name: 4. Ядро и DTS (thermal mod)
         run: |
           cd openwrt-source
+          make tools/install toolchain/install -j$(nproc)
           make target/linux/prepare -j$(nproc)
-          
-          DTS_FILE=$(find build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
+
+          DTS_FILE=$(find $KDIR_REL/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dts" -print -quit)
           echo "Патчим файл: $DTS_FILE"
-          
+
           cat << 'EOF' >> "$DTS_FILE"
           // === BPI-R4 THERMAL MOD START ===
           &pio {
@@ -67,6 +83,7 @@ jobs:
           };
 
           &{/thermal-zones} {
+                  /* SoC, датчик 2.5G Ethernet (MT7988_ETH2P5G_0) */
                   wifi-sfp-thermal {
                           polling-delay-passive = <1000>;
                           polling-delay = <5000>;
@@ -86,34 +103,72 @@ jobs:
                                   map3 { trip = <&sfp_t3>; cooling-device = <&sfp_fan 4 4>; };
                           };
                   };
+
+                  /* Виртуальный термометр Wi-Fi: /usr/sbin/r4-wifi-temp пишет в emul_temp температуру
+                   * MT7996 (драйвер отдаёт её только в hwmon). Пока emul_temp = 0 — реальный датчик lvts 3. */
+                  wifi-thermal {
+                          polling-delay-passive = <1000>;
+                          polling-delay = <5000>;
+                          thermal-sensors = <&lvts 3>;
+
+                          trips {
+                                  wifi_t0: wifi-t0 { temperature = <55000>; hysteresis = <2000>; type = "active"; };
+                                  wifi_t1: wifi-t1 { temperature = <62000>; hysteresis = <2000>; type = "active"; };
+                                  wifi_t2: wifi-t2 { temperature = <70000>; hysteresis = <2000>; type = "active"; };
+                                  wifi_t3: wifi-t3 { temperature = <78000>; hysteresis = <2000>; type = "active"; };
+                          };
+
+                          cooling-maps {
+                                  map0 { trip = <&wifi_t0>; cooling-device = <&sfp_fan 1 1>; };
+                                  map1 { trip = <&wifi_t1>; cooling-device = <&sfp_fan 2 2>; };
+                                  map2 { trip = <&wifi_t2>; cooling-device = <&sfp_fan 3 3>; };
+                                  map3 { trip = <&wifi_t3>; cooling-device = <&sfp_fan 4 4>; };
+                          };
+                  };
           };
           // === BPI-R4 THERMAL MOD END ===
           EOF
 
-      - name: 4. Компиляция Золотого DTB
-        run: |
-          cd openwrt-source
-          make -j$(nproc)
+          make target/linux/compile -j$(nproc)
 
-      - name: 5. Скачивание Image Builder и копирование DTB
+      - name: 5. Проверка - конфиг ядра = официальный + только THERMAL_EMULATION
         run: |
-          wget https://downloads.openwrt.org/releases/$OWRT_VER/targets/mediatek/filogic/openwrt-imagebuilder-$OWRT_VER-mediatek-filogic.Linux-x86_64.tar.zst
-          tar --zstd -xf openwrt-imagebuilder-$OWRT_VER-mediatek-filogic.Linux-x86_64.tar.zst
-          
-          GOLDEN_DTB=$(realpath $(find openwrt-source/build_dir/target-*/linux-mediatek_filogic/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" -print -quit))
-          
-          TARGET_DIR="openwrt-imagebuilder-$OWRT_VER-mediatek-filogic.Linux-x86_64/build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_filogic"
-          mkdir -p "$TARGET_DIR"
-          cp "$GOLDEN_DTB" "$TARGET_DIR/image-mt7988a-bananapi-bpi-r4.dtb"
+          norm() { grep -E '^(CONFIG_|# CONFIG_.* is not set)' "$1" | sort; }
+          OURS=$(ls openwrt-source/$KDIR_REL/linux-*/.config)
+          OFFICIAL=$(ls $IB_DIR/$KDIR_REL/linux-*/.config)
+          diff <(norm "$OFFICIAL") <(norm "$OURS") > kconfig.diff || true
+          cat kconfig.diff
+          EXPECTED=$(printf '%s\n' '< # CONFIG_THERMAL_EMULATION is not set' '> CONFIG_THERMAL_EMULATION=y')
+          [ "$(grep -E '^[<>]' kconfig.diff)" = "$EXPECTED" ] || { echo "Конфиг ядра расходится с официальным - kmod из репозитория могут не встать"; exit 1; }
 
-      - name: 6. Сборка финального образа
+      - name: 6. Ядро и DTB в Image Builder
         run: |
-          cd openwrt-imagebuilder-$OWRT_VER-mediatek-filogic.Linux-x86_64
-          make image PROFILE="bananapi_bpi-r4" PACKAGES="apk-mbedtls base-files ca-bundle dnsmasq dropbear firewall4 fitblk fstools kmod-crypto-hw-safexcel kmod-gpio-button-hotplug kmod-leds-gpio kmod-nft-offload libc libgcc libustream-mbedtls logd mtd netifd nftables odhcp6c odhcpd-ipv6only ppp ppp-mod-pppoe procd-ujail uboot-envtools uci uclient-fetch urandom-seed urngd wpad-basic-mbedtls kmod-hwmon-pwmfan kmod-i2c-mux-pca954x kmod-eeprom-at24 kmod-mt7996-firmware kmod-mt7996-233-firmware kmod-rtc-pcf8563 kmod-sfp kmod-usb3 e2fsprogs f2fsck mkf2fs mt7988-wo-firmware luci"
+          SRC=openwrt-source/$KDIR_REL
+          DST=$IB_DIR/$KDIR_REL
+          DTB=$(find $SRC/linux-*/arch/arm64/boot/dts/mediatek/ -name "mt7988a-bananapi-bpi-r4.dtb" -print -quit)
+          IMG=$(ls $SRC/linux-*/arch/arm64/boot/Image)
+          [ -f "$DTB" ] && [ -f "$IMG" ] || { echo "DTB или Image не собрались"; exit 1; }
+          cp "$DTB" $DST/image-mt7988a-bananapi-bpi-r4.dtb
+          # Image Builder берёт ядро из <device>-kernel.bin = gzip -9n Image (как Build/kernel-bin | gzip)
+          cp "$IMG" $DST/Image
+          gzip -9n -c "$IMG" > $DST/bananapi_bpi-r4-kernel.bin
+          # Overlay калибровки BE14 (TX power 2.4/5 ГГц) должен быть в Image Builder
+          ls $DST/image-mt7988a-bananapi-bpi-r4-wifi-be14.dtbo
 
-      - name: 7. Публикация всех прошивок (SD, eMMC, NAND)
+      - name: 7. Сборка финального образа
+        run: |
+          cd $IB_DIR
+          # Температура Wi-Fi -> виртуальный термометр wifi-thermal; rc.d-ссылка явно — IB сам сервисы из FILES не включает
+          rm -rf files && cp -a ../builder/files files
+          chmod 0755 files/usr/sbin/r4-wifi-temp files/etc/init.d/r4-wifi-temp
+          mkdir -p files/etc/rc.d && ln -sf ../init.d/r4-wifi-temp files/etc/rc.d/S95r4-wifi-temp
+          make image PROFILE="bananapi_bpi-r4" FILES="files" PACKAGES="apk-mbedtls base-files ca-bundle dnsmasq dropbear firewall4 fitblk fstools kmod-crypto-hw-safexcel kmod-gpio-button-hotplug kmod-leds-gpio kmod-nft-offload libc libgcc libustream-mbedtls logd mtd netifd nftables odhcp6c odhcpd-ipv6only ppp ppp-mod-pppoe procd-ujail uboot-envtools uci uclient-fetch urandom-seed urngd -wpad-basic-mbedtls wpad-openssl kmod-hwmon-pwmfan kmod-i2c-mux-pca954x kmod-eeprom-at24 kmod-mt7996-firmware kmod-mt7996-233-firmware kmod-rtc-pcf8563 kmod-sfp kmod-usb3 e2fsprogs f2fsck mkf2fs mt7988-wo-firmware luci luci-nginx nginx-mod-njs nginx-mod-stream luci-app-acme luci-app-adblock luci-app-banip luci-app-ddns luci-app-dockerman luci-app-samba4 luci-app-usteer block-mount kmod-nvme adb arp-scan ethtool iperf3 mc nano nmap openssh-client pciutils python3-pip tcpdump telnet-bsd transmission-daemon"
+
+      - name: 8. Публикация всех прошивок (SD, eMMC, NAND)
         uses: actions/upload-artifact@v4
         with:
           name: BPi-R4-Thermal-Mod-${{ env.OWRT_VER }}
-          path: openwrt-imagebuilder-${{ env.OWRT_VER }}-mediatek-filogic.Linux-x86_64/bin/targets/mediatek/filogic/*bananapi_bpi-r4*
+          path: |
+            ${{ env.IB_DIR }}/bin/targets/mediatek/filogic/*bananapi_bpi-r4*
+            kconfig.diff
           retention-days: 14
