@@ -133,13 +133,16 @@ jobs:
 
       - name: 5. Проверка - конфиг ядра = официальный + только THERMAL_EMULATION
         run: |
-          norm() { grep -E '^(CONFIG_|# CONFIG_.* is not set)' "$1" | sort; }
-          OURS=$(ls openwrt-source/$KDIR_REL/linux-*/.config)
-          OFFICIAL=$(ls $IB_DIR/$KDIR_REL/linux-*/.config)
-          diff <(norm "$OFFICIAL") <(norm "$OURS") > kconfig.diff || true
-          cat kconfig.diff
-          EXPECTED=$(printf '%s\n' '< # CONFIG_THERMAL_EMULATION is not set' '> CONFIG_THERMAL_EMULATION=y')
-          [ "$(grep -E '^[<>]' kconfig.diff)" = "$EXPECTED" ] || { echo "Конфиг ядра расходится с официальным - kmod из репозитория могут не встать"; exit 1; }
+          # Официальные kmod зависят от kernel=<ver>~<md5 отсортированных =y/=m строк .config.set>.
+          # Наш .config.set без THERMAL_EMULATION должен давать ровно этот хеш (.config после сборки
+          # не годится: OpenWrt дописывает в него RD_*/INITRAMFS на проходе initramfs).
+          L=$(ls -d openwrt-source/$KDIR_REL/linux-*)
+          OFFICIAL=$(ls $IB_DIR/packages/kernel-*.apk | sed -n 's/.*~\([0-9a-f]\{32\}\)-r[0-9]*\.apk$/\1/p')
+          OURS=$(grep '=[ym]' $L/.config.set | grep -v '^CONFIG_THERMAL_EMULATION=' | LC_ALL=C sort | md5sum | cut -d' ' -f1)
+          grep -q '^CONFIG_THERMAL_EMULATION=y' $L/.config.set || { echo "THERMAL_EMULATION не включилась"; exit 1; }
+          echo "official kernel hash: $OFFICIAL" | tee kconfig.check
+          echo "ours w/o THERMAL_EMULATION: $OURS" | tee -a kconfig.check
+          [ -n "$OFFICIAL" ] && [ "$OURS" = "$OFFICIAL" ] || { echo "Конфиг ядра расходится с официальным - kmod из репозитория могут не встать"; exit 1; }
 
       - name: 6. Ядро и DTB в Image Builder
         run: |
@@ -170,5 +173,5 @@ jobs:
           name: BPi-R4-Thermal-Mod-${{ env.OWRT_VER }}
           path: |
             ${{ env.IB_DIR }}/bin/targets/mediatek/filogic/*bananapi_bpi-r4*
-            kconfig.diff
+            kconfig.check
           retention-days: 14
